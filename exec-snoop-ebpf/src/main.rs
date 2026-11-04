@@ -113,95 +113,78 @@ fn try_exec_snoop(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
-unsafe fn is_agent_descendant() -> bool {
-    let tgid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
-    if tgid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&tgid) }.is_some() {
-        return true;
-    }
-
-    let mut task = unsafe { aya_ebpf::helpers::bpf_get_current_task() } as *const u8;
-    if task.is_null() {
-        return false;
-    }
-
-    // Walk real_parent up 3 levels
-    for _ in 0..3 {
-        // Offset 2816 is `real_parent` (*const u8) in `struct task_struct`
-        let parent = match unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(task.add(2816).cast::<*const u8>()) } {
-            Ok(p) => p,
-            Err(_) => break,
-        };
-
-        if parent.is_null() || parent == task {
-            break;
-        }
-
-        // Offset 2804 is `tgid` (u32) in `struct task_struct` for Linux 7.0.0-31-generic (x86_64)
-        if let Ok(parent_tgid) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(parent.add(2804).cast::<u32>()) } {
-            if parent_tgid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&parent_tgid) }.is_some() {
-                return true;
-            }
-            if parent_tgid <= 1 {
-                break;
-            }
-        } else {
-            break;
-        }
-
-        task = parent;
-    }
-
-    false
-}
-
 #[lsm(hook = "bprm_check_security")]
 pub fn bprm_check_security(ctx: LsmContext) -> i32 {
-    let retval: i32 = ctx.arg(1);
-    if retval != 0 {
-        return retval;
-    }
-
-    // Lineage check: only enforce block rule if current task or any ancestor (up to 3 levels)
-    // is registered in PROTECTED_AGENT_PIDS. Otherwise, permit immediately.
-    if !unsafe { is_agent_descendant() } {
-        return 0;
-    }
-
     let bprm_ptr: *const u8 = ctx.arg(0);
     if bprm_ptr.is_null() {
         return 0;
     }
 
-    // Read first 64 bytes of target binary filename
-    let mut filename_buf = [0u8; 64];
-    let filename_ptr: *const u8 = match unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(96).cast::<*const u8>()) } {
+    // Step 1: Check if current process OR any ancestor is fenced
+    let current_tgid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
+    let mut is_fenced = unsafe { PROTECTED_AGENT_PIDS.get(&current_tgid).is_some() };
+
+    if !is_fenced {
+        let mut task = unsafe { aya_ebpf::helpers::bpf_get_current_task() } as *const u8;
+        for _ in 0..4 {
+            if task.is_null() {
+                break;
+            }
+
+            // Offset 2816 is real_parent in task_struct for Linux 7.0.0-31-generic (x86_64)
+            let parent = match unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(task.add(2816).cast::<*const u8>()) } {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+
+            if parent.is_null() || parent == task {
+                break;
+            }
+
+            // Offset 2804 is tgid in task_struct
+            if let Ok(parent_tgid) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(parent.add(2804).cast::<u32>()) } {
+                if parent_tgid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&parent_tgid) }.is_some() {
+                    is_fenced = true;
+                    break;
+                }
+                if parent_tgid <= 1 {
+                    break;
+                }
+            } else {
+                break;
+            }
+
+            task = parent;
+        }
+    }
+
+    // If not fenced, permit immediately (host/regular processes run unimpeded)
+    if !is_fenced {
+        return 0;
+    }
+
+    // Step 2: Read filename from verified BTF offset 96 (bits_offset=768)
+    let filename_ptr: *const u8 = match unsafe {
+        aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(96).cast::<*const u8>())
+    } {
         Ok(ptr) if !ptr.is_null() => ptr,
-        _ => match unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(80).cast::<*const u8>()) } {
-            Ok(ptr) => ptr,
-            _ => core::ptr::null(),
-        },
+        _ => return 0,
     };
 
-    let mut matched = false;
-    if !filename_ptr.is_null() {
-        if let Ok(bytes) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut filename_buf) } {
-            if is_blocked(bytes) {
-                matched = true;
-            }
+    let mut buf = [0u8; 64];
+    if let Ok(bytes) = unsafe {
+        aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut buf)
+    } {
+        if is_blocked(bytes) {
+            return -1; // -EPERM
         }
     }
 
-    // Also inspect task comm as secondary verification
-    if !matched {
-        if let Ok(comm) = aya_ebpf::helpers::bpf_get_current_comm() {
-            if is_blocked(&comm) {
-                matched = true;
-            }
+    // Secondary check via task comm
+    if let Ok(comm) = aya_ebpf::helpers::bpf_get_current_comm() {
+        if is_blocked(&comm) {
+            return -1; // -EPERM
         }
-    }
-
-    if matched {
-        return -1; // -EPERM
     }
 
     0
