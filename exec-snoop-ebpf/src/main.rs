@@ -3,9 +3,9 @@
 
 use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid},
-    macros::{map, tracepoint},
+    macros::{lsm, map, tracepoint},
     maps::{PerCpuArray, RingBuf},
-    programs::TracePointContext,
+    programs::{LsmContext, TracePointContext},
     EbpfContext,
 };
 use exec_snoop_common::{ProcessExecEvent, MAX_ARGS_LEN};
@@ -86,6 +86,67 @@ fn try_exec_snoop(ctx: TracePointContext) -> Result<u32, u32> {
     }
 
     Ok(0)
+}
+
+#[lsm(hook = "bprm_check_security")]
+pub fn bprm_check_security(ctx: LsmContext) -> i32 {
+    let retval: i32 = ctx.arg(1);
+    if retval != 0 {
+        return retval;
+    }
+
+    let bprm_ptr: *const u8 = ctx.arg(0);
+    if bprm_ptr.is_null() {
+        return 0;
+    }
+
+    // Offset 96 is `filename` in `struct linux_binprm` on x86_64
+    let filename_ptr: *const u8 = match unsafe {
+        aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(96).cast())
+    } {
+        Ok(ptr) => ptr,
+        Err(_) => return 0,
+    };
+
+    if filename_ptr.is_null() {
+        return 0;
+    }
+
+    let mut buf = [0u8; 64];
+    let bytes = match unsafe {
+        aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut buf)
+    } {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+
+    if is_blocked(bytes) {
+        // Return -EPERM (-1) to abort execve with Operation Not Permitted
+        return -1;
+    }
+
+    0
+}
+
+#[inline(always)]
+fn is_blocked(path: &[u8]) -> bool {
+    let target = b"curl";
+    if path == target {
+        return true;
+    }
+    let len = path.len();
+    if len >= 5 {
+        let suffix = &path[len - 5..];
+        if suffix[0] == b'/'
+            && suffix[1] == b'c'
+            && suffix[2] == b'u'
+            && suffix[3] == b'r'
+            && suffix[4] == b'l'
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[panic_handler]

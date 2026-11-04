@@ -1,5 +1,6 @@
 use aya::maps::{PerCpuArray, RingBuf};
-use aya::programs::TracePoint;
+use aya::programs::{Lsm, TracePoint};
+use aya::Btf;
 use clap::Parser;
 use exec_snoop_common::{ProcessExecEvent, MAX_ARGS_LEN};
 use std::convert::TryInto;
@@ -71,6 +72,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     program.attach("sched", "sched_process_exec")?;
 
     println!("[+] eBPF program loaded and attached to sched:sched_process_exec");
+
+    if let Some(prog) = bpf.program_mut("bprm_check_security") {
+        match Btf::from_sys_fs() {
+            Ok(btf) => {
+                let lsm_program: Result<&mut Lsm, _> = prog.try_into();
+                match lsm_program {
+                    Ok(lsm_prog) => match lsm_prog.load("bprm_check_security", &btf) {
+                        Ok(()) => match lsm_prog.attach() {
+                            Ok(_) => println!("[+] eBPF LSM hook attached to bprm_check_security (blocking 'curl')"),
+                            Err(e) => eprintln!("[!] Failed to attach LSM hook: {e}"),
+                        },
+                        Err(e) => eprintln!("[!] Failed to load LSM program: {e}"),
+                    },
+                    Err(e) => eprintln!("[!] Failed to convert program to Lsm: {e}"),
+                }
+            }
+            Err(e) => eprintln!("[!] Failed to read BTF from sysfs: {e}"),
+        }
+    }
     println!("[+] Streaming process executions (Press Ctrl+C to stop)...");
 
     let ring_buf = RingBuf::try_from(
