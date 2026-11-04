@@ -4,17 +4,20 @@
 use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid},
     macros::{lsm, map, tracepoint},
-    maps::{PerCpuArray, RingBuf},
+    maps::{HashMap, PerCpuArray, RingBuf},
     programs::{LsmContext, TracePointContext},
     EbpfContext,
 };
-use exec_snoop_common::{ProcessExecEvent, MAX_ARGS_LEN};
+use exec_snoop_common::{ProcessExecEvent, MAX_AGENT_PIDS, MAX_ARGS_LEN};
 
 #[map]
 static RINGBUF: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 #[map]
 static DROPPED_EVENTS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+#[map]
+static PROTECTED_AGENT_PIDS: HashMap<u32, u32> = HashMap::with_max_entries(MAX_AGENT_PIDS, 0);
 
 #[tracepoint]
 pub fn exec_snoop(ctx: TracePointContext) -> u32 {
@@ -88,11 +91,57 @@ fn try_exec_snoop(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
+unsafe fn is_agent_descendant() -> bool {
+    let mut task = unsafe { aya_ebpf::helpers::bpf_get_current_task() } as *const u8;
+    if task.is_null() {
+        return false;
+    }
+
+    // Traverse real_parent up to 4 levels: current process + ancestors
+    for _ in 0..4 {
+        if task.is_null() {
+            break;
+        }
+
+        // Offset 2804 is `tgid` (u32) in `struct task_struct` for Linux 7.0.0-31-generic (x86_64)
+        if let Ok(tgid) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(task.add(2804).cast::<u32>()) } {
+            if tgid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&tgid) }.is_some() {
+                return true;
+            }
+            if tgid <= 1 {
+                break;
+            }
+        } else {
+            break;
+        }
+
+        // Offset 2816 is `real_parent` (*const u8) in `struct task_struct`
+        let parent = match unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(task.add(2816).cast::<*const u8>()) } {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+
+        if parent.is_null() || parent == task {
+            break;
+        }
+
+        task = parent;
+    }
+
+    false
+}
+
 #[lsm(hook = "bprm_check_security")]
 pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     let retval: i32 = ctx.arg(1);
     if retval != 0 {
         return retval;
+    }
+
+    // Lineage check: only enforce block rule if current task or any ancestor (up to 4 levels)
+    // is registered in PROTECTED_AGENT_PIDS. Otherwise, permit immediately.
+    if !unsafe { is_agent_descendant() } {
+        return 0;
     }
 
     let bprm_ptr: *const u8 = ctx.arg(0);

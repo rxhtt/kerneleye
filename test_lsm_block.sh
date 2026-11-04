@@ -32,3 +32,4 @@ fi
 
 echo ""
 echo "[+] Test finished without kernel panic or instability."
+

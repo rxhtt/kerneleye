@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Automated verification helper for agent PID fencing
+set -e
+
+echo "=== Kerneleye Targeted Agent Fencing Verification ==="
+echo ""
+echo "Test Procedure (Two-Terminal Workflow):"
+echo ""
+echo "Terminal B (The Agent / Sandboxed Session):"
+echo "  1. Get the shell PID:"
+echo "     echo \$\$"
+echo "     # Example output: 34567"
+echo ""
+echo "Terminal A (The Daemon):"
+echo "  2. Launch the telemetry and LSM enforcement daemon, fencing Terminal B's PID:"
+echo "     sudo ./target/release/exec-snoop --fence-pid <PID_FROM_TERMINAL_B>"
+echo ""
+echo "Verification:"
+echo "  3. In Terminal A (Host / Unfenced shell):"
+echo "     curl --version"
+echo "     -> Works normally (Host operations completely unimpeded)."
+echo ""
+echo "  4. In Terminal B (Fenced Agent shell or any child process it spawns):"
+echo "     curl --version"
+echo "     -> Immediately blocked with: 'bash: /usr/bin/curl: Operation not permitted'"
+echo "     -> The kernel returns -EPERM before execve commits."
+echo ""
+echo "======================================================="

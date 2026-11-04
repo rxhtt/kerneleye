@@ -2,6 +2,8 @@
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const MAX_ARGS_LEN: usize = 256;
+pub const MAX_AGENT_PIDS: u32 = 1024;
+pub const PROTECTED_AGENT_PIDS_MAP: &str = "PROTECTED_AGENT_PIDS";
 
 #[repr(C)]
 #[derive(Clone, Copy)]

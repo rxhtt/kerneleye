@@ -1,4 +1,4 @@
-use aya::maps::{PerCpuArray, RingBuf};
+use aya::maps::{HashMap, PerCpuArray, RingBuf};
 use aya::programs::{Lsm, TracePoint};
 use aya::Btf;
 use clap::Parser;
@@ -8,7 +8,11 @@ use std::time::Duration;
 use tokio::signal;
 
 #[derive(Debug, Parser)]
-struct Opt {}
+struct Opt {
+    /// Target PID(s) to fence. Any child spawned by these PIDs will be prevented from running curl.
+    #[arg(long = "fence-pid", value_name = "PID")]
+    fence_pid: Vec<u32>,
+}
 
 fn format_time() -> String {
     let now = std::time::SystemTime::now();
@@ -91,6 +95,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => eprintln!("[!] Failed to read BTF from sysfs: {e}"),
         }
     }
+    let mut protected_agent_pids: HashMap<_, u32, u32> = HashMap::try_from(
+        bpf.map_mut("PROTECTED_AGENT_PIDS")
+            .ok_or("PROTECTED_AGENT_PIDS map not found")?,
+    )?;
+
+    if _opt.fence_pid.is_empty() {
+        println!("[i] No --fence-pid specified. Running telemetry without agent restrictions.");
+    } else {
+        for &pid in &_opt.fence_pid {
+            protected_agent_pids.insert(pid, 1, 0)?;
+            println!("[+] Fenced agent PID {pid}: descendants are restricted from executing 'curl'.");
+        }
+    }
+
     println!("[+] Streaming process executions (Press Ctrl+C to stop)...");
 
     let ring_buf = RingBuf::try_from(
