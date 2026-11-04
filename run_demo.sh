@@ -59,10 +59,15 @@ mkfifo "$FIFO"
 AGENT_LOG=$(mktemp /tmp/agent_out.XXXXXX)
 DAEMON_LOG=$(mktemp /tmp/daemon_out.XXXXXX)
 
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+    SUDO="sudo"
+fi
+
 cleanup() {
     if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
         echo -e "\n[*] Detaching eBPF daemon (PID $DAEMON_PID)..."
-        sudo kill -INT "$DAEMON_PID" 2>/dev/null || true
+        $SUDO kill -INT "$DAEMON_PID" 2>/dev/null || true
         wait "$DAEMON_PID" 2>/dev/null || true
     fi
     rm -f "$FIFO" "$AGENT_LOG" "$DAEMON_LOG"
@@ -96,7 +101,7 @@ echo -e "[+] Captured target agent PID: ${BOLD}${AGENT_PID}${RESET}"
 
 # Launch daemon in background with targeted fence
 echo "[+] Starting exec-snoop daemon with --fence-pid $AGENT_PID..."
-sudo ./target/release/exec-snoop --fence-pid "$AGENT_PID" > "$DAEMON_LOG" 2>&1 &
+$SUDO ./target/release/exec-snoop --fence-pid "$AGENT_PID" > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 
 # Wait for daemon to attach and confirm map population

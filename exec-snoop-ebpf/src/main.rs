@@ -35,8 +35,8 @@ pub fn process_fork(ctx: TracePointContext) -> u32 {
 
 fn try_process_fork(ctx: TracePointContext) -> Result<(), u32> {
     let current_tgid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
-    let parent_pid: u32 = unsafe { ctx.read_at(12) }.unwrap_or(current_tgid);
-    let child_pid: u32 = unsafe { ctx.read_at(20) }.map_err(|_| 1u32)?;
+    let parent_pid: u32 = unsafe { ctx.read_at(24) }.unwrap_or(current_tgid);
+    let child_pid: u32 = unsafe { ctx.read_at(44) }.map_err(|_| 1u32)?;
 
     let is_parent_fenced = unsafe {
         PROTECTED_AGENT_PIDS.get(&parent_pid).is_some() || PROTECTED_AGENT_PIDS.get(&current_tgid).is_some()
@@ -191,22 +191,25 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         }
     }
 
-    // Fallback: bprm->filename (offset 96)
-    if !resolved {
-        if let Ok(filename_ptr) = unsafe {
-            aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(96).cast::<*const u8>())
-        } {
-            if !filename_ptr.is_null() {
-                let _ = unsafe {
-                    aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut buf)
-                };
-            }
-        }
-    }
-
-    if is_blocked(&buf) {
+    if resolved && is_blocked(&buf) {
         // Return -EPERM (-1) to abort execve with Operation Not Permitted
         return -1;
+    }
+
+    // Fallback: bprm->filename (offset 96)
+    if let Ok(filename_ptr) = unsafe {
+        aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(96).cast::<*const u8>())
+    } {
+        if !filename_ptr.is_null() {
+            buf = [0u8; 128];
+            if let Ok(bytes) = unsafe {
+                aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut buf)
+            } {
+                if is_blocked(bytes) {
+                    return -1;
+                }
+            }
+        }
     }
 
     0
@@ -214,21 +217,13 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 fn is_blocked(path: &[u8]) -> bool {
-    let target = b"curl";
-    let len = path.iter().position(|&b| b == 0).unwrap_or(path.len());
-    let slice = &path[..len];
-
-    if slice == target {
-        return true;
+    let mut len = 0;
+    while len < path.len() && path[len] != 0 {
+        len += 1;
     }
-    if len >= 5 {
-        let suffix = &slice[len - 5..];
-        if suffix[0] == b'/'
-            && suffix[1] == b'c'
-            && suffix[2] == b'u'
-            && suffix[3] == b'r'
-            && suffix[4] == b'l'
-        {
+    if len >= 4 {
+        let s = &path[..len];
+        if s.ends_with(b"curl") {
             return true;
         }
     }
