@@ -114,29 +114,18 @@ fn try_exec_snoop(ctx: TracePointContext) -> Result<u32, u32> {
 }
 
 unsafe fn is_agent_descendant() -> bool {
+    let tgid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
+    if tgid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&tgid) }.is_some() {
+        return true;
+    }
+
     let mut task = unsafe { aya_ebpf::helpers::bpf_get_current_task() } as *const u8;
     if task.is_null() {
         return false;
     }
 
-    // Traverse real_parent up to 4 levels: current process + ancestors
-    for _ in 0..4 {
-        if task.is_null() {
-            break;
-        }
-
-        // Offset 2804 is `tgid` (u32) in `struct task_struct` for Linux 7.0.0-31-generic (x86_64)
-        if let Ok(tgid) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(task.add(2804).cast::<u32>()) } {
-            if tgid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&tgid) }.is_some() {
-                return true;
-            }
-            if tgid <= 1 {
-                break;
-            }
-        } else {
-            break;
-        }
-
+    // Walk real_parent up 3 levels
+    for _ in 0..3 {
         // Offset 2816 is `real_parent` (*const u8) in `struct task_struct`
         let parent = match unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(task.add(2816).cast::<*const u8>()) } {
             Ok(p) => p,
@@ -144,6 +133,18 @@ unsafe fn is_agent_descendant() -> bool {
         };
 
         if parent.is_null() || parent == task {
+            break;
+        }
+
+        // Offset 2804 is `tgid` (u32) in `struct task_struct` for Linux 7.0.0-31-generic (x86_64)
+        if let Ok(parent_tgid) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(parent.add(2804).cast::<u32>()) } {
+            if parent_tgid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&parent_tgid) }.is_some() {
+                return true;
+            }
+            if parent_tgid <= 1 {
+                break;
+            }
+        } else {
             break;
         }
 
@@ -160,7 +161,7 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         return retval;
     }
 
-    // Lineage check: only enforce block rule if current task or any ancestor (up to 4 levels)
+    // Lineage check: only enforce block rule if current task or any ancestor (up to 3 levels)
     // is registered in PROTECTED_AGENT_PIDS. Otherwise, permit immediately.
     if !unsafe { is_agent_descendant() } {
         return 0;
@@ -171,45 +172,36 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         return 0;
     }
 
-    let mut buf = [0u8; 128];
-    let mut resolved = false;
+    // Read first 64 bytes of target binary filename
+    let mut filename_buf = [0u8; 64];
+    let filename_ptr: *const u8 = match unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(96).cast::<*const u8>()) } {
+        Ok(ptr) if !ptr.is_null() => ptr,
+        _ => match unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(80).cast::<*const u8>()) } {
+            Ok(ptr) => ptr,
+            _ => core::ptr::null(),
+        },
+    };
 
-    // Gap 2: Canonical Path Resolution with bpf_d_path
-    // Offset 64 in struct linux_binprm is file pointer (struct file *)
-    if let Ok(file_ptr) = unsafe {
-        aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(64).cast::<*mut aya_ebpf::bindings::file>())
-    } {
-        if !file_ptr.is_null() {
-            // Offset 64 in struct file is f_path (struct path)
-            let path_ptr = unsafe { (file_ptr as *mut u8).add(64) as *mut aya_ebpf::bindings::path };
-            let ret = unsafe {
-                aya_ebpf::helpers::bpf_d_path(path_ptr, buf.as_mut_ptr().cast(), buf.len() as u32)
-            };
-            if ret > 0 {
-                resolved = true;
+    let mut matched = false;
+    if !filename_ptr.is_null() {
+        if let Ok(bytes) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut filename_buf) } {
+            if is_blocked(bytes) {
+                matched = true;
             }
         }
     }
 
-    if resolved && is_blocked(&buf) {
-        // Return -EPERM (-1) to abort execve with Operation Not Permitted
-        return -1;
-    }
-
-    // Fallback: bprm->filename (offset 96)
-    if let Ok(filename_ptr) = unsafe {
-        aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(96).cast::<*const u8>())
-    } {
-        if !filename_ptr.is_null() {
-            buf = [0u8; 128];
-            if let Ok(bytes) = unsafe {
-                aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut buf)
-            } {
-                if is_blocked(bytes) {
-                    return -1;
-                }
+    // Also inspect task comm as secondary verification
+    if !matched {
+        if let Ok(comm) = aya_ebpf::helpers::bpf_get_current_comm() {
+            if is_blocked(&comm) {
+                matched = true;
             }
         }
+    }
+
+    if matched {
+        return -1; // -EPERM
     }
 
     0
