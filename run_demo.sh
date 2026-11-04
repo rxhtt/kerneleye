@@ -101,13 +101,13 @@ DAEMON_PID=$!
 
 # Wait for daemon to attach and confirm map population
 for _ in $(seq 1 50); do
-    if grep -q "Fenced agent PID $AGENT_PID" "$DAEMON_LOG" 2>/dev/null; then
+    if grep -q "Kernel map populated: PID $AGENT_PID fenced" "$DAEMON_LOG" 2>/dev/null; then
         break
     fi
     sleep 0.1
 done
 
-if ! grep -q "Fenced agent PID $AGENT_PID" "$DAEMON_LOG" 2>/dev/null; then
+if ! grep -q "Kernel map populated: PID $AGENT_PID fenced" "$DAEMON_LOG" 2>/dev/null; then
     echo -e "${RED}[-] Daemon failed to initialize within timeout. Log:${RESET}"
     cat "$DAEMON_LOG"
     exit 1
@@ -136,3 +136,4 @@ echo ""
 echo -e "${BOLD}==============================================================================${RESET}"
 echo -e "${BOLD}   VERIFICATION COMPLETE: Zero False Positives | Strict Agent Confinement      ${RESET}"
 echo -e "${BOLD}==============================================================================${RESET}"
+

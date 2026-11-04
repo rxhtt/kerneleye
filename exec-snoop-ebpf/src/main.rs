@@ -27,6 +27,28 @@ pub fn exec_snoop(ctx: TracePointContext) -> u32 {
     }
 }
 
+#[tracepoint]
+pub fn process_fork(ctx: TracePointContext) -> u32 {
+    let _ = try_process_fork(ctx);
+    0
+}
+
+fn try_process_fork(ctx: TracePointContext) -> Result<(), u32> {
+    let current_tgid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
+    let parent_pid: u32 = unsafe { ctx.read_at(12) }.unwrap_or(current_tgid);
+    let child_pid: u32 = unsafe { ctx.read_at(20) }.map_err(|_| 1u32)?;
+
+    let is_parent_fenced = unsafe {
+        PROTECTED_AGENT_PIDS.get(&parent_pid).is_some() || PROTECTED_AGENT_PIDS.get(&current_tgid).is_some()
+    };
+
+    if is_parent_fenced {
+        let _ = PROTECTED_AGENT_PIDS.insert(&child_pid, &1, 0);
+    }
+
+    Ok(())
+}
+
 unsafe fn get_ppid() -> u32 {
     let task = unsafe { aya_ebpf::helpers::bpf_get_current_task() } as *const u8;
     if task.is_null() {
@@ -149,27 +171,40 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         return 0;
     }
 
-    // Offset 96 is `filename` in `struct linux_binprm` on x86_64
-    let filename_ptr: *const u8 = match unsafe {
-        aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(96).cast())
-    } {
-        Ok(ptr) => ptr,
-        Err(_) => return 0,
-    };
+    let mut buf = [0u8; 128];
+    let mut resolved = false;
 
-    if filename_ptr.is_null() {
-        return 0;
+    // Gap 2: Canonical Path Resolution with bpf_d_path
+    // Offset 64 in struct linux_binprm is file pointer (struct file *)
+    if let Ok(file_ptr) = unsafe {
+        aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(64).cast::<*mut aya_ebpf::bindings::file>())
+    } {
+        if !file_ptr.is_null() {
+            // Offset 64 in struct file is f_path (struct path)
+            let path_ptr = unsafe { (file_ptr as *mut u8).add(64) as *mut aya_ebpf::bindings::path };
+            let ret = unsafe {
+                aya_ebpf::helpers::bpf_d_path(path_ptr, buf.as_mut_ptr().cast(), buf.len() as u32)
+            };
+            if ret > 0 {
+                resolved = true;
+            }
+        }
     }
 
-    let mut buf = [0u8; 64];
-    let bytes = match unsafe {
-        aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut buf)
-    } {
-        Ok(b) => b,
-        Err(_) => return 0,
-    };
+    // Fallback: bprm->filename (offset 96)
+    if !resolved {
+        if let Ok(filename_ptr) = unsafe {
+            aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(96).cast::<*const u8>())
+        } {
+            if !filename_ptr.is_null() {
+                let _ = unsafe {
+                    aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut buf)
+                };
+            }
+        }
+    }
 
-    if is_blocked(bytes) {
+    if is_blocked(&buf) {
         // Return -EPERM (-1) to abort execve with Operation Not Permitted
         return -1;
     }
@@ -180,12 +215,14 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
 #[inline(always)]
 fn is_blocked(path: &[u8]) -> bool {
     let target = b"curl";
-    if path == target {
+    let len = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    let slice = &path[..len];
+
+    if slice == target {
         return true;
     }
-    let len = path.len();
     if len >= 5 {
-        let suffix = &path[len - 5..];
+        let suffix = &slice[len - 5..];
         if suffix[0] == b'/'
             && suffix[1] == b'c'
             && suffix[2] == b'u'

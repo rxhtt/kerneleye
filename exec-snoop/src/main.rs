@@ -77,6 +77,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("[+] eBPF program loaded and attached to sched:sched_process_exec");
 
+    if let Some(fork_prog) = bpf.program_mut("process_fork") {
+        let fork_program: Result<&mut TracePoint, _> = fork_prog.try_into();
+        match fork_program {
+            Ok(p) => {
+                if let Err(e) = p.load() {
+                    eprintln!("[!] Failed to load process_fork: {e}");
+                } else if let Err(e) = p.attach("sched", "sched_process_fork") {
+                    eprintln!("[!] Failed to attach sched:sched_process_fork: {e}");
+                } else {
+                    println!("[+] eBPF fork tracker attached to sched:sched_process_fork");
+                }
+            }
+            Err(e) => eprintln!("[!] Failed to convert process_fork to TracePoint: {e}"),
+        }
+    }
+
     if let Some(prog) = bpf.program_mut("bprm_check_security") {
         match Btf::from_sys_fs() {
             Ok(btf) => {
@@ -105,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         for &pid in &_opt.fence_pid {
             protected_agent_pids.insert(pid, 1, 0)?;
-            println!("[+] Fenced agent PID {pid}: descendants are restricted from executing 'curl'.");
+            println!("[+] Kernel map populated: PID {pid} fenced.");
         }
     }
 
