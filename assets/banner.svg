@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 220" width="100%" height="100%">
+  <defs>
+    <!-- Background Gradient -->
+    <linearGradient id="bannerBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b0f17"/>
+      <stop offset="50%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </linearGradient>
+
+    <!-- Gradients -->
+    <linearGradient id="cyanBlue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+
+    <linearGradient id="emeraldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+
+    <linearGradient id="textGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="60%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#94a3b8"/>
+    </linearGradient>
+
+    <filter id="bannerGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Banner Background -->
+  <rect width="920" height="220" rx="20" fill="url(#bannerBg)"/>
+  <rect width="918" height="218" x="1" y="1" rx="19" fill="none" stroke="#1e293b" stroke-width="1.5"/>
+
+  <!-- Left: Emblem Icon (Scaled to 140x140 at x=40, y=40) -->
+  <g transform="translate(45, 40) scale(0.2734)">
+    <!-- Background circle for logo icon -->
+    <rect width="512" height="512" rx="112" fill="#030712" stroke="#1e293b" stroke-width="4"/>
+    <circle cx="256" cy="256" r="200" fill="none" stroke="#1e293b" stroke-width="3" stroke-dasharray="8 8"/>
+    
+    <!-- Outer Shield Arcs -->
+    <g filter="url(#bannerGlow)">
+      <path d="M 120 256 C 120 160, 180 110, 256 110 C 332 110, 392 160, 392 256" 
+            fill="none" stroke="url(#cyanBlue)" stroke-width="14" stroke-linecap="round"/>
+      <path d="M 120 256 C 120 352, 180 402, 256 402 C 332 402, 392 352, 392 256" 
+            fill="none" stroke="url(#emeraldGrad)" stroke-width="14" stroke-linecap="round"/>
+    </g>
+
+    <!-- Core Iris & Pupil -->
+    <circle cx="256" cy="256" r="82" fill="#0f172a" stroke="#38bdf8" stroke-width="6"/>
+    <circle cx="256" cy="256" r="50" fill="#020617" stroke="url(#cyanBlue)" stroke-width="6"/>
+    <circle cx="256" cy="256" r="26" fill="url(#emeraldGrad)"/>
+    <circle cx="256" cy="256" r="10" fill="#ffffff" filter="url(#bannerGlow)"/>
+  </g>
+
+  <!-- Right: Typography & Hierarchy -->
+  <g transform="translate(220, 0)">
+    <!-- Category Pill -->
+    <rect x="0" y="44" width="168" height="24" rx="12" fill="#0c4a6e" fill-opacity="0.5" stroke="#0284c7" stroke-width="1"/>
+    <text x="12" y="60" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#38bdf8" letter-spacing="1.5">eBPF LSM RUNTIME</text>
+
+    <!-- Main Title -->
+    <text x="0" y="112" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="44" font-weight="800" fill="url(#textGrad)" letter-spacing="-0.5">
+      Kernel<tspan fill="#38bdf8">Eye</tspan>
+    </text>
+
+    <!-- Subtitle -->
+    <text x="0" y="146" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="16" font-weight="500" fill="#94a3b8">
+      Deterministic AI Agent Runtime Confinement &amp; Process Fencing
+    </text>
+
+    <!-- Feature Tags -->
+    <g transform="translate(0, 168)">
+      <text x="0" y="0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="500" fill="#64748b">
+        • Zero Containers  • bprm_check_security  • socket_connect  • ~3.2 µs Overhead
+      </text>
+    </g>
+  </g>
+</svg>
+

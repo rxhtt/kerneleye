@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Background Gradient -->
+    <radialGradient id="bgGrad" cx="50%" cy="50%" r="50%" fx="50%" fy="50%">
+      <stop offset="0%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#030712"/>
+    </radialGradient>
+
+    <!-- Cyan/Blue Primary Glow Gradient -->
+    <linearGradient id="cyanBlueGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00f2fe"/>
+      <stop offset="50%" stop-color="#4facfe"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+
+    <!-- Emerald Success/Security Gradient -->
+    <linearGradient id="emeraldGrad" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#059669"/>
+      <stop offset="50%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+
+    <!-- Violet Accent Gradient -->
+    <linearGradient id="violetGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#a855f7"/>
+      <stop offset="100%" stop-color="#6366f1"/>
+    </linearGradient>
+
+    <!-- Subtle Metallic Ring Gradient -->
+    <linearGradient id="ringGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.8"/>
+      <stop offset="50%" stop-color="#1e293b" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0.8"/>
+    </linearGradient>
+
+    <!-- Soft Ambient Glow Filters -->
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="12" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+    
+    <filter id="deepGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="28" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Canvas Background -->
+  <rect width="512" height="512" rx="112" fill="url(#bgGrad)"/>
+  <rect width="510" height="510" x="1" y="1" rx="111" fill="none" stroke="#1f2937" stroke-width="2"/>
+
+  <!-- Subtle Concentric Kernel Rings (Ring 0 Architecture) -->
+  <circle cx="256" cy="256" r="200" fill="none" stroke="#1e293b" stroke-width="1.5" stroke-dasharray="4 8" opacity="0.6"/>
+  <circle cx="256" cy="256" r="160" fill="none" stroke="#1e293b" stroke-width="1.5" stroke-dasharray="8 6" opacity="0.7"/>
+
+  <!-- Ambient Backdrop Glow behind the Eye -->
+  <circle cx="256" cy="256" r="110" fill="#0284c7" opacity="0.15" filter="url(#deepGlow)"/>
+  <circle cx="256" cy="256" r="60" fill="#10b981" opacity="0.2" filter="url(#deepGlow)"/>
+
+  <!-- Outer Defensive Shield / Aperture Petals (Geometric Precision) -->
+  <g filter="url(#glow)">
+    <!-- Top Arc - Kernel Space Barrier -->
+    <path d="M 120 256 C 120 160, 180 110, 256 110 C 332 110, 392 160, 392 256" 
+          fill="none" stroke="url(#cyanBlueGrad)" stroke-width="6" stroke-linecap="round"/>
+    
+    <!-- Bottom Arc - Runtime Confinement Barrier -->
+    <path d="M 120 256 C 120 352, 180 402, 256 402 C 332 402, 392 352, 392 256" 
+          fill="none" stroke="url(#emeraldGrad)" stroke-width="6" stroke-linecap="round"/>
+  </g>
+
+  <!-- Dynamic Interlaced eBPF Event Arcs (Confinement Ring) -->
+  <path d="M 160 256 C 160 185, 202 150, 256 150 C 310 150, 352 185, 352 256" 
+        fill="none" stroke="url(#cyanBlueGrad)" stroke-width="3" stroke-dasharray="80 30" stroke-linecap="round" opacity="0.9"/>
+  <path d="M 160 256 C 160 327, 202 362, 256 362 C 310 362, 352 327, 352 256" 
+        fill="none" stroke="url(#emeraldGrad)" stroke-width="3" stroke-dasharray="60 40" stroke-linecap="round" opacity="0.9"/>
+
+  <!-- Outer Anchor Points (Process Nodes) -->
+  <circle cx="120" cy="256" r="6" fill="#00f2fe" filter="url(#glow)"/>
+  <circle cx="392" cy="256" r="6" fill="#10b981" filter="url(#glow)"/>
+
+  <!-- Inner Geometric Lens (The Eye Core) -->
+  <!-- Outer Iris Ring -->
+  <circle cx="256" cy="256" r="76" fill="#0f172a" stroke="url(#ringGrad)" stroke-width="3.5"/>
+
+  <!-- Inner Hexagonal Kernel Ring (Hardware / Ring 0 representation) -->
+  <polygon points="256,194 310,225 310,287 256,318 202,287 202,225" 
+           fill="none" stroke="#334155" stroke-width="2" stroke-dasharray="4 4"/>
+
+  <!-- Luminescent Cyan Iris Core -->
+  <circle cx="256" cy="256" r="48" fill="#030712" stroke="url(#cyanBlueGrad)" stroke-width="4" filter="url(#glow)"/>
+
+  <!-- Central Pupil: The KernelEye Focal Singularity -->
+  <circle cx="256" cy="256" r="24" fill="url(#emeraldGrad)"/>
+  <circle cx="256" cy="256" r="10" fill="#ffffff" opacity="0.9" filter="url(#glow)"/>
+
+  <!-- Subtle Crosshair Targeting Reticle (Telemetry & Interception) -->
+  <line x1="256" y1="172" x2="256" y2="182" stroke="#38bdf8" stroke-width="2" stroke-linecap="round"/>
+  <line x1="256" y1="330" x2="256" y2="340" stroke="#34d399" stroke-width="2" stroke-linecap="round"/>
+  <line x1="172" y1="256" x2="182" y2="256" stroke="#38bdf8" stroke-width="2" stroke-linecap="round"/>
+  <line x1="330" y1="256" x2="340" y2="256" stroke="#34d399" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- Micro Orbit Nodes representing eBPF Probes -->
+  <circle cx="218" cy="218" r="3.5" fill="#38bdf8" opacity="0.8"/>
+  <circle cx="294" cy="294" r="3.5" fill="#34d399" opacity="0.8"/>
+</svg>
