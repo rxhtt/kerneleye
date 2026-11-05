@@ -291,31 +291,41 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     0
 }
 
-// Scan path bytes for the substring "curl" bounded by a path separator, null,
-// space, or newline so that "curlylocks" is not a false positive.
-// The slice passed here is already trimmed to the string length by
-// bpf_probe_read_kernel_str_bytes (the returned slice excludes the null
-// terminator), so a trailing null check is still included for the raw-buf path.
+// Check whether path ends with the basename "curl" as a complete path component.
+// bpf_probe_read_kernel_str_bytes returns a slice that excludes the null terminator,
+// so path.len() is the exact string length.  All index arithmetic below is guarded
+// by explicit len checks to give the BPF verifier fixed upper-bound proofs.
+// A scanning while-loop is not used: the verifier unrolls loops per-iteration and
+// cannot prove the induction variable is bounded by the slice length alone, causing
+// "invalid read from stack" when the computed offset exceeds the frame boundary.
 #[inline(always)]
 fn is_blocked(path: &[u8]) -> bool {
-    let tlen: usize = 4; // b"curl".len()
-    if path.len() < tlen {
+    let len = path.len();
+    // Need at least four bytes for "curl".
+    if len < 4 {
         return false;
     }
-    let mut i = 0;
-    while i <= path.len() - tlen {
-        if path[i] == 0 {
-            break;
-        }
-        if path[i] == b'c' && path[i + 1] == b'u' && path[i + 2] == b'r' && path[i + 3] == b'l' {
-            let after = if i + 4 < path.len() { path[i + 4] } else { 0 };
-            if after == 0 || after == b'/' || after == b' ' || after == b'\n' {
-                return true;
-            }
-        }
-        i += 1;
+    // Match the final four bytes against "curl" in reverse order.
+    // Reverse order lets the verifier discharge each bound check immediately.
+    if path[len - 1] != b'l' {
+        return false;
     }
-    false
+    if path[len - 2] != b'r' {
+        return false;
+    }
+    if path[len - 3] != b'u' {
+        return false;
+    }
+    if path[len - 4] != b'c' {
+        return false;
+    }
+    // Confirmed the string ends with "curl".  It must be a complete basename:
+    // either the entire string is "curl" (len == 4) or immediately preceded by '/'.
+    if len == 4 {
+        return true;
+    }
+    // len >= 5 is guaranteed here, so path[len - 5] is in bounds.
+    path[len - 5] == b'/'
 }
 
 #[panic_handler]
