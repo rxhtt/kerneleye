@@ -12,6 +12,15 @@ use exec_snoop_common::{
     ConfinementViolationEvent, ProcessExecEvent, MAX_AGENT_PIDS, MAX_ARGS_LEN,
 };
 
+mod vmlinux;
+use vmlinux::{linux_binprm, sockaddr, task_struct};
+
+macro_rules! bpf_core_read {
+    ($target:expr) => {
+        aya_ebpf::helpers::bpf_probe_read_kernel(core::ptr::addr_of!($target))
+    };
+}
+
 #[map]
 static RINGBUF: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
@@ -66,29 +75,21 @@ fn try_process_fork(ctx: TracePointContext) -> Result<(), u32> {
 }
 
 unsafe fn get_ppid() -> u32 {
-    let task = unsafe { aya_ebpf::helpers::bpf_get_current_task() } as *const u8;
+    let task = unsafe { aya_ebpf::helpers::bpf_get_current_task() } as *const task_struct;
     if task.is_null() {
         return 0;
     }
 
-    // Offset of real_parent in task_struct for Linux 7.0.0-31-generic (x86_64):
-    //   bits_offset=22528 -> byte offset 2816
-    let parent_task_ptr: *const u8 = match unsafe {
-        aya_ebpf::helpers::bpf_probe_read_kernel(task.add(2816).cast())
-    } {
+    let parent = match unsafe { bpf_core_read!((*task).real_parent) } {
         Ok(ptr) => ptr,
         Err(_) => return 0,
     };
 
-    if parent_task_ptr.is_null() {
+    if parent.is_null() {
         return 0;
     }
 
-    // Offset of tgid in task_struct for Linux 7.0.0-31-generic (x86_64):
-    //   bits_offset=22432 -> byte offset 2804
-    match unsafe {
-        aya_ebpf::helpers::bpf_probe_read_kernel(parent_task_ptr.add(2804).cast::<u32>())
-    } {
+    match unsafe { bpf_core_read!((*parent).tgid) } {
         Ok(ppid) => ppid,
         Err(_) => 0,
     }
@@ -144,33 +145,27 @@ fn get_fenced_root_pid(current_tgid: u32, current_pid: u32) -> u32 {
         return current_pid;
     }
 
-    let mut task = unsafe { aya_ebpf::helpers::bpf_get_current_task() as *const u8 };
+    let mut task = unsafe { aya_ebpf::helpers::bpf_get_current_task() as *const task_struct };
     for _ in 0..4 {
         if task.is_null() {
             break;
         }
 
-        let parent: *const u8 = match unsafe {
-            aya_ebpf::helpers::bpf_probe_read_kernel(task.add(2816).cast::<*const u8>())
-        } {
+        let parent: *mut task_struct = match unsafe { bpf_core_read!((*task).real_parent) } {
             Ok(p) => p,
             Err(_) => break,
         };
 
-        if parent.is_null() || parent == task {
+        if parent.is_null() || (parent as *const task_struct) == task {
             break;
         }
 
-        let ptgid: u32 = match unsafe {
-            aya_ebpf::helpers::bpf_probe_read_kernel(parent.add(2804).cast::<u32>())
-        } {
+        let ptgid: u32 = match unsafe { bpf_core_read!((*parent).tgid) } {
             Ok(v) => v,
             Err(_) => break,
         };
 
-        let ppid_val: u32 = match unsafe {
-            aya_ebpf::helpers::bpf_probe_read_kernel(parent.add(2800).cast::<u32>())
-        } {
+        let ppid_val: u32 = match unsafe { bpf_core_read!((*parent).pid) } {
             Ok(v) => v,
             Err(_) => break,
         };
@@ -183,7 +178,7 @@ fn get_fenced_root_pid(current_tgid: u32, current_pid: u32) -> u32 {
             return ppid_val;
         }
 
-        task = parent;
+        task = parent as *const task_struct;
     }
 
     0
@@ -251,8 +246,8 @@ fn is_blocked_binary(path: &[u8]) -> bool {
 
 #[lsm(hook = "bprm_check_security")]
 pub fn bprm_check_security(ctx: LsmContext) -> i32 {
-    let bprm_ptr: *const u8 = ctx.arg(0);
-    if bprm_ptr.is_null() {
+    let bprm: *const linux_binprm = ctx.arg(0);
+    if bprm.is_null() {
         return 0;
     }
 
@@ -279,11 +274,9 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         }
     }
 
-    // Check bprm->filename at offset 96
+    // Read bprm->filename via CO-RE field accessor
     let mut buf = [0u8; 64];
-    if let Ok(filename_ptr) = unsafe {
-        aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(96).cast::<*const u8>())
-    } {
+    if let Ok(filename_ptr) = unsafe { bpf_core_read!((*bprm).filename) } {
         if !filename_ptr.is_null() {
             if let Ok(bytes) = unsafe {
                 aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut buf)
@@ -323,12 +316,10 @@ pub fn socket_connect(ctx: LsmContext) -> i32 {
     let _ = PROTECTED_AGENT_PIDS.insert(&current_tgid, &1, 0);
     let _ = PROTECTED_AGENT_PIDS.insert(&current_pid, &1, 0);
 
-    // Check address family if address pointer is available (arg 1)
-    let addr_ptr: *const u8 = ctx.arg(1);
-    if !addr_ptr.is_null() {
-        if let Ok(family) = unsafe {
-            aya_ebpf::helpers::bpf_probe_read_kernel(addr_ptr.cast::<u16>())
-        } {
+    // Check address family via CO-RE field accessor (arg 1)
+    let addr: *const sockaddr = ctx.arg(1);
+    if !addr.is_null() {
+        if let Ok(family) = unsafe { bpf_core_read!((*addr).sa_family) } {
             // AF_INET = 2, AF_INET6 = 10
             if family == 2 || family == 10 {
                 let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
