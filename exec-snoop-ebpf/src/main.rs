@@ -129,9 +129,12 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     let pid_tgid = aya_ebpf::helpers::bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
     let pid = pid_tgid as u32;
+    let ppid = unsafe { get_ppid() };
 
     let mut is_fenced = unsafe {
-        PROTECTED_AGENT_PIDS.get(&tgid).is_some() || PROTECTED_AGENT_PIDS.get(&pid).is_some()
+        PROTECTED_AGENT_PIDS.get(&tgid).is_some()
+            || PROTECTED_AGENT_PIDS.get(&pid).is_some()
+            || (ppid > 0 && PROTECTED_AGENT_PIDS.get(&ppid).is_some())
     };
 
     if !is_fenced {
@@ -155,8 +158,6 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
             if let Ok(parent_tgid) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(parent.add(2804).cast::<u32>()) } {
                 if parent_tgid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&parent_tgid) }.is_some() {
                     is_fenced = true;
-                    let _ = PROTECTED_AGENT_PIDS.insert(&tgid, &1, 0);
-                    let _ = PROTECTED_AGENT_PIDS.insert(&pid, &1, 0);
                     break;
                 }
                 if parent_tgid <= 1 {
@@ -168,8 +169,6 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
             if let Ok(parent_pid) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(parent.add(2800).cast::<u32>()) } {
                 if parent_pid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&parent_pid) }.is_some() {
                     is_fenced = true;
-                    let _ = PROTECTED_AGENT_PIDS.insert(&tgid, &1, 0);
-                    let _ = PROTECTED_AGENT_PIDS.insert(&pid, &1, 0);
                     break;
                 }
             }
@@ -178,8 +177,11 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         }
     }
 
-    // If not fenced, permit immediately (host/regular processes run unimpeded)
-    if !is_fenced {
+    // If fenced, register current process IDs in map for instantaneous lookup
+    if is_fenced {
+        let _ = PROTECTED_AGENT_PIDS.insert(&tgid, &1, 0);
+        let _ = PROTECTED_AGENT_PIDS.insert(&pid, &1, 0);
+    } else {
         return 0;
     }
 
@@ -195,6 +197,12 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
                 let mut buf = [0u8; 64];
                 if let Ok(bytes) = unsafe {
                     aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut buf)
+                } {
+                    if is_blocked(bytes) {
+                        blocked = true;
+                    }
+                } else if let Ok(bytes) = unsafe {
+                    aya_ebpf::helpers::bpf_probe_read_user_str_bytes(filename_ptr, &mut buf)
                 } {
                     if is_blocked(bytes) {
                         blocked = true;
