@@ -138,6 +138,8 @@ if grep -q "Operation Not Permitted" "$AGENT_LOG" 2>/dev/null || grep -q "CRITIC
     echo "The build task succeeded, but credential exfiltration was aborted with -EPERM."
 else
     echo -e "${YELLOW}[!] Notice: Review logs above.${RESET}"
+    echo -e "${YELLOW}[*] Daemon log:${RESET}"
+    cat "$DAEMON_LOG" 2>/dev/null || true
 fi
 
 echo ""
