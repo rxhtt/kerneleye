@@ -138,16 +138,16 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     let current_tgid = (pid_tgid >> 32) as u32;
     let current_pid = pid_tgid as u32;
 
-    // Step 1: Check if current process OR any ancestor is fenced.
-    // Check the calling process first (cheapest path).
+    // Check direct registration in map
     let mut is_fenced = unsafe {
         PROTECTED_AGENT_PIDS.get(&current_tgid).is_some()
             || PROTECTED_AGENT_PIDS.get(&current_pid).is_some()
     };
 
-    // If not directly fenced, walk up to 4 ancestors via task_struct->real_parent.
-    // All reads must go through bpf_probe_read_kernel; raw dereferences on scalar
-    // registers are rejected by the verifier unconditionally.
+    // If not directly recorded, traverse up to 4 ancestors using verified offsets:
+    // real_parent = offset 2816 (bits 22528)
+    // tgid        = offset 2804 (bits 22432)
+    // pid         = offset 2800 (bits 22400)
     if !is_fenced {
         let mut task = unsafe { aya_ebpf::helpers::bpf_get_current_task() as *const u8 };
 
@@ -156,7 +156,6 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
                 break;
             }
 
-            // real_parent: bits_offset=22528 -> byte offset 2816
             let parent: *const u8 = match unsafe {
                 aya_ebpf::helpers::bpf_probe_read_kernel(task.add(2816).cast::<*const u8>())
             } {
@@ -168,7 +167,6 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
                 break;
             }
 
-            // tgid: bits_offset=22432 -> byte offset 2804
             let ptgid: u32 = match unsafe {
                 aya_ebpf::helpers::bpf_probe_read_kernel(parent.add(2804).cast::<u32>())
             } {
@@ -176,7 +174,6 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
                 Err(_) => break,
             };
 
-            // pid: bits_offset=22400 -> byte offset 2800
             let ppid_val: u32 = match unsafe {
                 aya_ebpf::helpers::bpf_probe_read_kernel(parent.add(2800).cast::<u32>())
             } {
@@ -199,17 +196,19 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         return 0;
     }
 
-    // Eagerly register the executing process so its children inherit fencing
-    // even if the fork tracepoint races.
+    // Auto-propagate fenced state to current process
     let _ = PROTECTED_AGENT_PIDS.insert(&current_tgid, &1, 0);
     let _ = PROTECTED_AGENT_PIDS.insert(&current_pid, &1, 0);
 
-    // Step 2: Binary inspection. Check three independent sources for the
-    // target binary name so that any read path that succeeds is sufficient.
-    let mut buf = [0u8; 64];
+    // Fast-path: check comm
+    if let Ok(comm) = aya_ebpf::helpers::bpf_get_current_comm() {
+        if comm[0] == b'c' && comm[1] == b'u' && comm[2] == b'r' && comm[3] == b'l' {
+            return -1; // -EPERM
+        }
+    }
 
-    // Check 1: bprm->filename (const char *) at byte offset 96 (bits_offset=768).
-    // bprm_ptr is trusted_ptr_linux_binprm per BTF; bpf_probe_read_kernel is correct here.
+    // Check bprm->filename at offset 96
+    let mut buf = [0u8; 64];
     if let Ok(filename_ptr) = unsafe {
         aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(96).cast::<*const u8>())
     } {
@@ -218,71 +217,13 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
                 aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut buf)
             } {
                 if is_blocked(bytes) {
-                    return -1;
+                    return -1; // -EPERM
                 }
             } else if let Ok(bytes) = unsafe {
                 aya_ebpf::helpers::bpf_probe_read_user_str_bytes(filename_ptr, &mut buf)
             } {
                 if is_blocked(bytes) {
-                    return -1;
-                }
-            }
-        }
-    }
-
-    // Check 2: bprm->interp (const char *) at byte offset 104 (bits_offset=832).
-    if let Ok(interp_ptr) = unsafe {
-        aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(104).cast::<*const u8>())
-    } {
-        if !interp_ptr.is_null() {
-            if let Ok(bytes) = unsafe {
-                aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(interp_ptr, &mut buf)
-            } {
-                if is_blocked(bytes) {
-                    return -1;
-                }
-            } else if let Ok(bytes) = unsafe {
-                aya_ebpf::helpers::bpf_probe_read_user_str_bytes(interp_ptr, &mut buf)
-            } {
-                if is_blocked(bytes) {
-                    return -1;
-                }
-            }
-        }
-    }
-
-    // Check 3: bprm->file->f_path.dentry->d_name.name
-    // bprm->file:        byte offset 64  (bits_offset=512)
-    // file->f_path:      byte offset 64  (bits_offset=512, union member __f_path)
-    // f_path.dentry:     byte offset 8   (bits_offset=64)
-    // dentry->(anon):    byte offset 32  (bits_offset=256) which is the qstr union
-    // qstr.name:         byte offset 8   (bits_offset=64)
-    // Combined dentry->d_name.name: dentry + 32 + 8 = dentry + 40
-    if let Ok(file_ptr) = unsafe {
-        aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(64).cast::<*const u8>())
-    } {
-        if !file_ptr.is_null() {
-            // f_path starts at offset 64 within struct file (the anonymous union member __f_path).
-            // dentry is at f_path+8, so file+64+8 = file+72.
-            if let Ok(dentry_ptr) = unsafe {
-                aya_ebpf::helpers::bpf_probe_read_kernel(file_ptr.add(72).cast::<*const u8>())
-            } {
-                if !dentry_ptr.is_null() {
-                    // d_name is an anonymous union at dentry+32; its qstr.name is at +8 within
-                    // the qstr, so dentry+32+8 = dentry+40.
-                    if let Ok(name_ptr) = unsafe {
-                        aya_ebpf::helpers::bpf_probe_read_kernel(dentry_ptr.add(40).cast::<*const u8>())
-                    } {
-                        if !name_ptr.is_null() {
-                            if let Ok(bytes) = unsafe {
-                                aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf)
-                            } {
-                                if is_blocked(bytes) {
-                                    return -1;
-                                }
-                            }
-                        }
-                    }
+                    return -1; // -EPERM
                 }
             }
         }
@@ -291,40 +232,30 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     0
 }
 
-// Check whether path ends with the basename "curl" as a complete path component.
-// bpf_probe_read_kernel_str_bytes returns a slice that excludes the null terminator,
-// so path.len() is the exact string length.  All index arithmetic below is guarded
-// by explicit len checks to give the BPF verifier fixed upper-bound proofs.
-// A scanning while-loop is not used: the verifier unrolls loops per-iteration and
-// cannot prove the induction variable is bounded by the slice length alone, causing
-// "invalid read from stack" when the computed offset exceeds the frame boundary.
 #[inline(always)]
 fn is_blocked(path: &[u8]) -> bool {
-    let len = path.len();
-    // Need at least four bytes for "curl".
+    let mut len = path.len();
+    // bpf_probe_read_*_str includes the trailing null byte
+    if len > 0 && path[len - 1] == 0 {
+        len -= 1;
+    }
+
     if len < 4 {
         return false;
     }
-    // Match the final four bytes against "curl" in reverse order.
-    // Reverse order lets the verifier discharge each bound check immediately.
-    if path[len - 1] != b'l' {
+
+    if path[len - 1] != b'l'
+        || path[len - 2] != b'r'
+        || path[len - 3] != b'u'
+        || path[len - 4] != b'c'
+    {
         return false;
     }
-    if path[len - 2] != b'r' {
-        return false;
-    }
-    if path[len - 3] != b'u' {
-        return false;
-    }
-    if path[len - 4] != b'c' {
-        return false;
-    }
-    // Confirmed the string ends with "curl".  It must be a complete basename:
-    // either the entire string is "curl" (len == 4) or immediately preceded by '/'.
+
     if len == 4 {
         return true;
     }
-    // len >= 5 is guaranteed here, so path[len - 5] is in bounds.
+
     path[len - 5] == b'/'
 }
 
