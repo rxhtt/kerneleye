@@ -11,7 +11,7 @@ exec-snoop-common = { path = "../exec-snoop-common", features = ["user"] }
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
 aya-log = { workspace = true }
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "help"] }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
