@@ -35,8 +35,8 @@ pub fn process_fork(ctx: TracePointContext) -> u32 {
 
 fn try_process_fork(ctx: TracePointContext) -> Result<(), u32> {
     let current_tgid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
-    let parent_pid: u32 = unsafe { ctx.read_at(24) }.unwrap_or(current_tgid);
-    let child_pid: u32 = unsafe { ctx.read_at(44) }.map_err(|_| 1u32)?;
+    let parent_pid: u32 = unsafe { ctx.read_at(12) }.unwrap_or(current_tgid);
+    let child_pid: u32 = unsafe { ctx.read_at(20) }.map_err(|_| 1u32)?;
 
     let is_parent_fenced = unsafe {
         PROTECTED_AGENT_PIDS.get(&parent_pid).is_some() || PROTECTED_AGENT_PIDS.get(&current_tgid).is_some()
@@ -121,8 +121,13 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     }
 
     // Step 1: Check if current process OR any ancestor is fenced
-    let current_tgid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
-    let mut is_fenced = unsafe { PROTECTED_AGENT_PIDS.get(&current_tgid).is_some() };
+    let pid_tgid = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+    let tgid = (pid_tgid >> 32) as u32;
+    let pid = pid_tgid as u32;
+
+    let mut is_fenced = unsafe {
+        PROTECTED_AGENT_PIDS.get(&tgid).is_some() || PROTECTED_AGENT_PIDS.get(&pid).is_some()
+    };
 
     if !is_fenced {
         let mut task = unsafe { aya_ebpf::helpers::bpf_get_current_task() } as *const u8;
