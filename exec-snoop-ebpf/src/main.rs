@@ -257,12 +257,27 @@ fn is_blocked(path: &[u8]) -> bool {
     while len < path.len() && path[len] != 0 {
         len += 1;
     }
-    if len >= 4 {
-        let s = &path[..len];
-        if s.ends_with(b"curl") {
-            return true;
-        }
+    if len < 4 {
+        return false;
     }
+    let s = &path[..len];
+
+    if s == b"curl" || s.ends_with(b"/curl") || s.ends_with(b"curl") {
+        return true;
+    }
+
+    let mut i = 0;
+    while i + 4 <= len {
+        if s[i] == b'c' && s[i + 1] == b'u' && s[i + 2] == b'r' && s[i + 3] == b'l' {
+            let before_ok = (i == 0) || (s[i - 1] == b'/');
+            let after_ok = (i + 4 == len) || (s[i + 4] == b' ') || (s[i + 4] == 0);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+
     false
 }
 
