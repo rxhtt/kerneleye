@@ -124,6 +124,31 @@ fn try_exec_snoop(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
+fn debug_log(tag: &[u8], pid: u32, ppid: u32, info: &[u8]) {
+    if let Some(mut entry) = RINGBUF.reserve::<ProcessExecEvent>(0) {
+        let mut comm = [0u8; 16];
+        let mut len = 0;
+        while len < tag.len() && len < 16 {
+            comm[len] = tag[len];
+            len += 1;
+        }
+        let mut args = [0u8; MAX_ARGS_LEN];
+        let mut info_len = 0;
+        while info_len < info.len() && info_len < MAX_ARGS_LEN {
+            args[info_len] = info[info_len];
+            info_len += 1;
+        }
+        entry.write(ProcessExecEvent {
+            pid,
+            ppid,
+            args_len: info_len,
+            comm,
+            args,
+        });
+        entry.submit(0);
+    }
+}
+
 #[lsm(hook = "bprm_check_security")]
 pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     let pid_tgid = aya_ebpf::helpers::bpf_get_current_pid_tgid();
@@ -177,7 +202,6 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         }
     }
 
-    // If fenced, register current process IDs in map for instantaneous lookup
     if is_fenced {
         let _ = PROTECTED_AGENT_PIDS.insert(&tgid, &1, 0);
         let _ = PROTECTED_AGENT_PIDS.insert(&pid, &1, 0);
@@ -186,6 +210,7 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     }
 
     let mut blocked = false;
+    let mut read_ok = false;
 
     // Check 1: bprm->filename at offset 96
     let bprm_ptr: *const u8 = ctx.arg(0);
@@ -198,12 +223,16 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
                 if let Ok(bytes) = unsafe {
                     aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut buf)
                 } {
+                    read_ok = true;
+                    debug_log(b"LSM_FENCE_KSTR", pid, ppid, bytes);
                     if is_blocked(bytes) {
                         blocked = true;
                     }
                 } else if let Ok(bytes) = unsafe {
                     aya_ebpf::helpers::bpf_probe_read_user_str_bytes(filename_ptr, &mut buf)
                 } {
+                    read_ok = true;
+                    debug_log(b"LSM_FENCE_USTR", pid, ppid, bytes);
                     if is_blocked(bytes) {
                         blocked = true;
                     }
@@ -230,6 +259,8 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
                                     if let Ok(bytes) = unsafe {
                                         aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf)
                                     } {
+                                        read_ok = true;
+                                        debug_log(b"LSM_DENTRY", pid, ppid, bytes);
                                         if is_blocked(bytes) {
                                             blocked = true;
                                         }
@@ -250,6 +281,10 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
                 blocked = true;
             }
         }
+    }
+
+    if !read_ok {
+        debug_log(b"LSM_NO_READ", pid, ppid, b"cannot read filename");
     }
 
     if blocked {
