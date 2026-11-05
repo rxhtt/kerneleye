@@ -17,3 +17,16 @@ pub struct ProcessExecEvent {
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ProcessExecEvent {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ConfinementViolationEvent {
+    pub timestamp_ns: u64,
+    pub agent_pid: u32,
+    pub child_pid: u32,
+    pub binary: [u8; 32],
+    pub comm: [u8; TASK_COMM_LEN],
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ConfinementViolationEvent {}

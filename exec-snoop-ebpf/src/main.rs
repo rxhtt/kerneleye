@@ -8,16 +8,24 @@ use aya_ebpf::{
     programs::{LsmContext, TracePointContext},
     EbpfContext,
 };
-use exec_snoop_common::{ProcessExecEvent, MAX_AGENT_PIDS, MAX_ARGS_LEN};
+use exec_snoop_common::{
+    ConfinementViolationEvent, ProcessExecEvent, MAX_AGENT_PIDS, MAX_ARGS_LEN,
+};
 
 #[map]
 static RINGBUF: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+#[map]
+static VIOLATIONS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 #[map]
 static DROPPED_EVENTS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 #[map]
 static PROTECTED_AGENT_PIDS: HashMap<u32, u32> = HashMap::with_max_entries(MAX_AGENT_PIDS, 0);
+
+#[map]
+static BLOCKED_BINARIES: HashMap<[u8; 16], u8> = HashMap::with_max_entries(64, 0);
 
 #[tracepoint]
 pub fn exec_snoop(ctx: TracePointContext) -> u32 {
@@ -127,6 +135,120 @@ fn try_exec_snoop(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
+#[inline(always)]
+fn get_fenced_root_pid(current_tgid: u32, current_pid: u32) -> u32 {
+    if unsafe { PROTECTED_AGENT_PIDS.get(&current_tgid).is_some() } {
+        return current_tgid;
+    }
+    if unsafe { PROTECTED_AGENT_PIDS.get(&current_pid).is_some() } {
+        return current_pid;
+    }
+
+    let mut task = unsafe { aya_ebpf::helpers::bpf_get_current_task() as *const u8 };
+    for _ in 0..4 {
+        if task.is_null() {
+            break;
+        }
+
+        let parent: *const u8 = match unsafe {
+            aya_ebpf::helpers::bpf_probe_read_kernel(task.add(2816).cast::<*const u8>())
+        } {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+
+        if parent.is_null() || parent == task {
+            break;
+        }
+
+        let ptgid: u32 = match unsafe {
+            aya_ebpf::helpers::bpf_probe_read_kernel(parent.add(2804).cast::<u32>())
+        } {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+
+        let ppid_val: u32 = match unsafe {
+            aya_ebpf::helpers::bpf_probe_read_kernel(parent.add(2800).cast::<u32>())
+        } {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+
+        if ptgid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&ptgid).is_some() } {
+            return ptgid;
+        }
+
+        if ppid_val > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&ppid_val).is_some() } {
+            return ppid_val;
+        }
+
+        task = parent;
+    }
+
+    0
+}
+
+#[inline(always)]
+fn emit_violation(agent_pid: u32, child_pid: u32, comm: [u8; 16], binary: &[u8]) {
+    if let Some(mut entry) = VIOLATIONS.reserve::<ConfinementViolationEvent>(0) {
+        let ptr = entry.as_mut_ptr();
+        unsafe {
+            (*ptr).timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+            (*ptr).agent_pid = agent_pid;
+            (*ptr).child_pid = child_pid;
+            (*ptr).comm = comm;
+            let mut bin = [0u8; 32];
+            let n = if binary.len() < 32 { binary.len() } else { 31 };
+            for i in 0..31 {
+                if i < n {
+                    bin[i] = binary[i];
+                }
+            }
+            (*ptr).binary = bin;
+        }
+        entry.submit(0);
+    }
+}
+
+#[inline(always)]
+fn extract_basename_key(path: &[u8]) -> [u8; 16] {
+    let mut len = path.len();
+    if len > 0 && path[len - 1] == 0 {
+        len -= 1;
+    }
+    let mut start = 0usize;
+    let bound = if len < 64 { len } else { 64 };
+    for i in 0..64 {
+        if i < bound && path[i] == b'/' {
+            start = i + 1;
+        }
+    }
+    let mut key = [0u8; 16];
+    if start <= len {
+        let name_len = len - start;
+        for j in 0..15 {
+            if j < name_len && start + j < path.len() {
+                key[j] = path[start + j];
+            }
+        }
+    }
+    key
+}
+
+#[inline(always)]
+fn is_blocked_binary(path: &[u8]) -> bool {
+    let key = extract_basename_key(path);
+    if unsafe { BLOCKED_BINARIES.get(&key).is_some() } {
+        return true;
+    }
+    // Backward-compatibility fallback: check "curl"
+    if key[0] == b'c' && key[1] == b'u' && key[2] == b'r' && key[3] == b'l' && key[4] == 0 {
+        return true;
+    }
+    false
+}
+
 #[lsm(hook = "bprm_check_security")]
 pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     let bprm_ptr: *const u8 = ctx.arg(0);
@@ -138,61 +260,8 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     let current_tgid = (pid_tgid >> 32) as u32;
     let current_pid = pid_tgid as u32;
 
-    // Check direct registration in map
-    let mut is_fenced = unsafe {
-        PROTECTED_AGENT_PIDS.get(&current_tgid).is_some()
-            || PROTECTED_AGENT_PIDS.get(&current_pid).is_some()
-    };
-
-    // If not directly recorded, traverse up to 4 ancestors using verified offsets:
-    // real_parent = offset 2816 (bits 22528)
-    // tgid        = offset 2804 (bits 22432)
-    // pid         = offset 2800 (bits 22400)
-    if !is_fenced {
-        let mut task = unsafe { aya_ebpf::helpers::bpf_get_current_task() as *const u8 };
-
-        for _ in 0..4 {
-            if task.is_null() {
-                break;
-            }
-
-            let parent: *const u8 = match unsafe {
-                aya_ebpf::helpers::bpf_probe_read_kernel(task.add(2816).cast::<*const u8>())
-            } {
-                Ok(p) => p,
-                Err(_) => break,
-            };
-
-            if parent.is_null() || parent == task {
-                break;
-            }
-
-            let ptgid: u32 = match unsafe {
-                aya_ebpf::helpers::bpf_probe_read_kernel(parent.add(2804).cast::<u32>())
-            } {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-
-            let ppid_val: u32 = match unsafe {
-                aya_ebpf::helpers::bpf_probe_read_kernel(parent.add(2800).cast::<u32>())
-            } {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-
-            if (ptgid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&ptgid).is_some() })
-                || (ppid_val > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&ppid_val).is_some() })
-            {
-                is_fenced = true;
-                break;
-            }
-
-            task = parent;
-        }
-    }
-
-    if !is_fenced {
+    let fenced_root_pid = get_fenced_root_pid(current_tgid, current_pid);
+    if fenced_root_pid == 0 {
         return 0;
     }
 
@@ -202,7 +271,10 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
 
     // Fast-path: check comm
     if let Ok(comm) = aya_ebpf::helpers::bpf_get_current_comm() {
-        if comm[0] == b'c' && comm[1] == b'u' && comm[2] == b'r' && comm[3] == b'l' {
+        if unsafe { BLOCKED_BINARIES.get(&comm).is_some() }
+            || (comm[0] == b'c' && comm[1] == b'u' && comm[2] == b'r' && comm[3] == b'l')
+        {
+            emit_violation(fenced_root_pid, current_pid, comm, b"curl\0");
             return -1; // -EPERM
         }
     }
@@ -216,13 +288,17 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
             if let Ok(bytes) = unsafe {
                 aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut buf)
             } {
-                if is_blocked(bytes) {
+                if is_blocked_binary(bytes) {
+                    let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
+                    emit_violation(fenced_root_pid, current_pid, comm, bytes);
                     return -1; // -EPERM
                 }
             } else if let Ok(bytes) = unsafe {
                 aya_ebpf::helpers::bpf_probe_read_user_str_bytes(filename_ptr, &mut buf)
             } {
-                if is_blocked(bytes) {
+                if is_blocked_binary(bytes) {
+                    let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
+                    emit_violation(fenced_root_pid, current_pid, comm, bytes);
                     return -1; // -EPERM
                 }
             }
@@ -232,31 +308,37 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     0
 }
 
-#[inline(always)]
-fn is_blocked(path: &[u8]) -> bool {
-    let mut len = path.len();
-    // bpf_probe_read_*_str includes the trailing null byte
-    if len > 0 && path[len - 1] == 0 {
-        len -= 1;
+#[lsm(hook = "socket_connect")]
+pub fn socket_connect(ctx: LsmContext) -> i32 {
+    let pid_tgid = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+    let current_tgid = (pid_tgid >> 32) as u32;
+    let current_pid = pid_tgid as u32;
+
+    let fenced_root_pid = get_fenced_root_pid(current_tgid, current_pid);
+    if fenced_root_pid == 0 {
+        return 0;
     }
 
-    if len < 4 {
-        return false;
+    // Auto-propagate fenced state
+    let _ = PROTECTED_AGENT_PIDS.insert(&current_tgid, &1, 0);
+    let _ = PROTECTED_AGENT_PIDS.insert(&current_pid, &1, 0);
+
+    // Check address family if address pointer is available (arg 1)
+    let addr_ptr: *const u8 = ctx.arg(1);
+    if !addr_ptr.is_null() {
+        if let Ok(family) = unsafe {
+            aya_ebpf::helpers::bpf_probe_read_kernel(addr_ptr.cast::<u16>())
+        } {
+            // AF_INET = 2, AF_INET6 = 10
+            if family == 2 || family == 10 {
+                let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
+                emit_violation(fenced_root_pid, current_pid, comm, b"network:socket_connect\0");
+                return -1; // -EPERM
+            }
+        }
     }
 
-    if path[len - 1] != b'l'
-        || path[len - 2] != b'r'
-        || path[len - 3] != b'u'
-        || path[len - 4] != b'c'
-    {
-        return false;
-    }
-
-    if len == 4 {
-        return true;
-    }
-
-    path[len - 5] == b'/'
+    0
 }
 
 #[panic_handler]

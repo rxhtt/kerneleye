@@ -2,16 +2,24 @@ use aya::maps::{HashMap, PerCpuArray, RingBuf};
 use aya::programs::{Lsm, TracePoint};
 use aya::Btf;
 use clap::Parser;
-use exec_snoop_common::{ProcessExecEvent, MAX_ARGS_LEN};
+use exec_snoop_common::{ConfinementViolationEvent, ProcessExecEvent, MAX_ARGS_LEN};
 use std::convert::TryInto;
 use std::time::Duration;
 use tokio::signal;
 
 #[derive(Debug, Parser)]
 struct Opt {
-    /// Target PID(s) to fence. Any child spawned by these PIDs will be prevented from running curl.
+    /// Target PID(s) to fence. Any child spawned by these PIDs will be restricted.
     #[arg(long = "fence-pid", value_name = "PID")]
     fence_pid: Vec<u32>,
+
+    /// Terminate the fenced root agent session immediately upon confinement violation.
+    #[arg(long = "kill-on-violation")]
+    kill_on_violation: bool,
+
+    /// Comma-separated list of unauthorized binary basenames to block for fenced agents.
+    #[arg(long = "block", default_value = "curl,wget,nc,ncat,socat")]
+    block: String,
 }
 
 fn format_time() -> String {
@@ -100,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match lsm_program {
                     Ok(lsm_prog) => match lsm_prog.load("bprm_check_security", &btf) {
                         Ok(()) => match lsm_prog.attach() {
-                            Ok(_) => println!("[+] eBPF LSM hook attached to bprm_check_security (blocking 'curl')"),
+                            Ok(_) => println!("[+] eBPF LSM hook attached to bprm_check_security (blocking configured binaries)"),
                             Err(e) => eprintln!("[!] Failed to attach LSM hook: {e}"),
                         },
                         Err(e) => eprintln!("[!] Failed to load LSM program: {e}"),
@@ -111,6 +119,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => eprintln!("[!] Failed to read BTF from sysfs: {e}"),
         }
     }
+
+    if let Some(prog) = bpf.program_mut("socket_connect") {
+        match Btf::from_sys_fs() {
+            Ok(btf) => {
+                let lsm_program: Result<&mut Lsm, _> = prog.try_into();
+                match lsm_program {
+                    Ok(lsm_prog) => match lsm_prog.load("socket_connect", &btf) {
+                        Ok(()) => match lsm_prog.attach() {
+                            Ok(_) => println!("[+] eBPF LSM hook attached to socket_connect (blocking AF_INET/AF_INET6 egress)"),
+                            Err(e) => eprintln!("[!] Failed to attach socket_connect hook: {e}"),
+                        },
+                        Err(e) => eprintln!("[!] Failed to load socket_connect program: {e}"),
+                    },
+                    Err(e) => eprintln!("[!] Failed to convert socket_connect to Lsm: {e}"),
+                }
+            }
+            Err(e) => eprintln!("[!] Failed to read BTF from sysfs for socket_connect: {e}"),
+        }
+    }
+
+    if let Some(map) = bpf.map_mut("BLOCKED_BINARIES") {
+        if let Ok(mut blocked_map) = HashMap::<_, [u8; 16], u8>::try_from(map) {
+            for raw_name in _opt.block.split(',') {
+                let name = raw_name.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                let mut key = [0u8; 16];
+                let bytes = name.as_bytes();
+                let len = bytes.len().min(15);
+                key[..len].copy_from_slice(&bytes[..len]);
+                if let Err(e) = blocked_map.insert(key, 1, 0) {
+                    eprintln!("[!] Failed to insert '{name}' into BLOCKED_BINARIES map: {e}");
+                }
+            }
+            println!("[+] Populated BLOCKED_BINARIES policy: {}", _opt.block);
+        }
+    }
+
     let mut protected_agent_pids: HashMap<_, u32, u32> = HashMap::try_from(
         bpf.map_mut("PROTECTED_AGENT_PIDS")
             .ok_or("PROTECTED_AGENT_PIDS map not found")?,
@@ -132,6 +179,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("RINGBUF map not found")?,
     )?;
     let mut async_ring_buf = unsafe { tokio::io::unix::AsyncFd::register(ring_buf) }?;
+
+    let violations_buf = bpf.take_map("VIOLATIONS").and_then(|m| RingBuf::try_from(m).ok());
+    let mut async_violations = match violations_buf {
+        Some(rb) => unsafe { tokio::io::unix::AsyncFd::register(rb).ok() },
+        None => None,
+    };
 
     let dropped_events: PerCpuArray<_, u64> = PerCpuArray::try_from(
         bpf.take_map("DROPPED_EVENTS")
@@ -155,6 +208,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 if total_drops > 0 {
                     println!("[WARN] Ring buffer overflow detected: {total_drops} dropped execution events.");
+                }
+            }
+            res = async {
+                match async_violations.as_mut() {
+                    Some(fd) => fd.readable_mut().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Ok(mut guard) = res {
+                    let inner = guard.get_inner_mut();
+                    while let Some(item) = inner.next() {
+                        let event = unsafe { &*(item.as_ptr() as *const ConfinementViolationEvent) };
+                        let comm_str = std::str::from_utf8(&event.comm)
+                            .unwrap_or("<invalid utf8>")
+                            .trim_matches(char::from(0));
+                        let bin_str = std::str::from_utf8(&event.binary)
+                            .unwrap_or("<invalid utf8>")
+                            .trim_matches(char::from(0));
+
+                        eprintln!(
+                            "{{\"event\":\"confinement_violation\",\"timestamp_ns\":{},\"agent_pid\":{},\"child_pid\":{},\"comm\":\"{}\",\"binary\":\"{}\"}}",
+                            event.timestamp_ns, event.agent_pid, event.child_pid, comm_str, bin_str
+                        );
+
+                        if _opt.kill_on_violation && event.agent_pid > 0 {
+                            eprintln!(
+                                "[KILL-SWITCH] Terminating fenced root agent session PID {} with SIGKILL...",
+                                event.agent_pid
+                            );
+                            unsafe {
+                                libc::kill(event.agent_pid as libc::pid_t, libc::SIGKILL);
+                            }
+                        }
+                    }
+                    guard.clear_ready();
                 }
             }
             guard = async_ring_buf.readable_mut() => {
