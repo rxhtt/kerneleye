@@ -136,51 +136,11 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     let pid = pid_tgid as u32;
     let ppid = unsafe { get_ppid() };
 
-    let mut is_fenced = unsafe {
+    let is_fenced = unsafe {
         PROTECTED_AGENT_PIDS.get(&tgid).is_some()
             || PROTECTED_AGENT_PIDS.get(&pid).is_some()
             || (ppid > 0 && PROTECTED_AGENT_PIDS.get(&ppid).is_some())
     };
-
-    if !is_fenced {
-        let mut task = unsafe { aya_ebpf::helpers::bpf_get_current_task() } as *const u8;
-        for _ in 0..4 {
-            if task.is_null() {
-                break;
-            }
-
-            // Offset 2816 is real_parent in task_struct for Linux 7.0.0-31-generic (x86_64)
-            let parent: *const u8 = match unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(task.add(2816).cast()) } {
-                Ok(p) => p,
-                Err(_) => break,
-            };
-
-            if parent.is_null() || parent == task {
-                break;
-            }
-
-            // Check tgid (offset 2804)
-            if let Ok(parent_tgid) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(parent.add(2804).cast::<u32>()) } {
-                if parent_tgid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&parent_tgid) }.is_some() {
-                    is_fenced = true;
-                    break;
-                }
-                if parent_tgid <= 1 {
-                    break;
-                }
-            }
-
-            // Check pid (offset 2800)
-            if let Ok(parent_pid) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(parent.add(2800).cast::<u32>()) } {
-                if parent_pid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&parent_pid) }.is_some() {
-                    is_fenced = true;
-                    break;
-                }
-            }
-
-            task = parent;
-        }
-    }
 
     if is_fenced {
         let _ = PROTECTED_AGENT_PIDS.insert(&tgid, &1, 0);
@@ -261,23 +221,7 @@ fn is_blocked(path: &[u8]) -> bool {
     }
     let s = &path[..len];
 
-    if s == b"curl" || s.ends_with(b"/curl") || s.ends_with(b"curl") {
-        return true;
-    }
-
-    let mut i = 0;
-    while i + 4 <= len {
-        if s[i] == b'c' && s[i + 1] == b'u' && s[i + 2] == b'r' && s[i + 3] == b'l' {
-            let before_ok = (i == 0) || (s[i - 1] == b'/');
-            let after_ok = (i + 4 == len) || (s[i + 4] == b' ') || (s[i + 4] == 0);
-            if before_ok && after_ok {
-                return true;
-            }
-        }
-        i += 1;
-    }
-
-    false
+    s == b"curl" || s.ends_with(b"/curl") || s.ends_with(b"curl")
 }
 
 #[panic_handler]

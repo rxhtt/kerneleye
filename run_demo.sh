@@ -108,7 +108,7 @@ $SUDO ./target/release/exec-snoop --fence-pid "$AGENT_PID" > "$DAEMON_LOG" 2>&1 
 DAEMON_PID=$!
 
 # Wait for daemon to attach and confirm map population
-for _ in $(seq 1 50); do
+for _ in $(seq 1 100); do
     if grep -q "Kernel map populated: PID $AGENT_PID fenced" "$DAEMON_LOG" 2>/dev/null; then
         break
     fi
