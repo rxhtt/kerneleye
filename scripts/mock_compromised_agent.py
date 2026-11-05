@@ -42,13 +42,13 @@ def main():
     except (PermissionError, OSError) as e:
         # Kernel LSM returns -EPERM on execve
         if isinstance(e, PermissionError) or getattr(e, "errno", None) == 1:
-            print("[CRITICAL ERROR] Sycall aborted by kernel runtime fence (Operation Not Permitted). Exfiltration prevented.")
+            print("[CRITICAL ERROR] Syscall aborted by kernel runtime fence (Operation Not Permitted). Exfiltration prevented.")
         else:
             print(f"[!] Unexpected OS error: {e}")
     except subprocess.CalledProcessError as e:
         # If wrapped or exit code is 126 (Command cannot execute / permission denied)
         if e.returncode == 126 or "Operation not permitted" in (e.stderr or ""):
-            print("[CRITICAL ERROR] Sycall aborted by kernel runtime fence (Operation Not Permitted). Exfiltration prevented.")
+            print("[CRITICAL ERROR] Syscall aborted by kernel runtime fence (Operation Not Permitted). Exfiltration prevented.")
         else:
             # Command was allowed to execute by the kernel, but network connection failed
             print("[!] [UNRESTRICTED] Kernel allowed curl execution.")
