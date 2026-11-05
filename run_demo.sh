@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+cd "$SCRIPT_DIR"
+
 BOLD='\033[1m'
 RED='\033[31m'
 GREEN='\033[32m'

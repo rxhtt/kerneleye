@@ -10,11 +10,15 @@ def main():
 
     # Step 1: Simulate a legitimate developer build step
     print("[*] STEP 1: Running legitimate developer build task...")
-    build_artifact = "/tmp/agent_build_mock.o"
+    build_artifact = f"/tmp/agent_build_mock_{pid}.o"
     try:
         with open(build_artifact, "w") as f:
             f.write("/* Mock compiled binary artifact */\nint main() { return 0; }\n")
         print(f"[+] Build step succeeded. Artifact generated at {build_artifact}")
+        try:
+            os.remove(build_artifact)
+        except OSError:
+            pass
     except Exception as e:
         print(f"[-] Legitimate build failed unexpectedly: {e}")
         sys.exit(1)
