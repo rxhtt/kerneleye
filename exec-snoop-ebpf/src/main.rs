@@ -124,33 +124,13 @@ fn try_exec_snoop(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
-fn debug_log(tag: &[u8], pid: u32, ppid: u32, info: &[u8]) {
-    if let Some(mut entry) = RINGBUF.reserve::<ProcessExecEvent>(0) {
-        let mut comm = [0u8; 16];
-        let mut len = 0;
-        while len < tag.len() && len < 16 {
-            comm[len] = tag[len];
-            len += 1;
-        }
-        let mut args = [0u8; MAX_ARGS_LEN];
-        let mut info_len = 0;
-        while info_len < info.len() && info_len < MAX_ARGS_LEN {
-            args[info_len] = info[info_len];
-            info_len += 1;
-        }
-        entry.write(ProcessExecEvent {
-            pid,
-            ppid,
-            args_len: info_len,
-            comm,
-            args,
-        });
-        entry.submit(0);
-    }
-}
-
 #[lsm(hook = "bprm_check_security")]
 pub fn bprm_check_security(ctx: LsmContext) -> i32 {
+    let bprm_ptr: *const u8 = ctx.arg(0);
+    if bprm_ptr.is_null() {
+        return 0;
+    }
+
     let pid_tgid = aya_ebpf::helpers::bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
     let pid = pid_tgid as u32;
@@ -170,7 +150,7 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
             }
 
             // Offset 2816 is real_parent in task_struct for Linux 7.0.0-31-generic (x86_64)
-            let parent = match unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(task.add(2816).cast::<*const u8>()) } {
+            let parent: *const u8 = match unsafe { aya_ebpf::helpers::bpf_probe_read_kernel(task.add(2816).cast()) } {
                 Ok(p) => p,
                 Err(_) => break,
             };
@@ -210,60 +190,49 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     }
 
     let mut blocked = false;
-    let mut read_ok = false;
+    let mut buf = [0u8; 64];
 
     // Check 1: bprm->filename at offset 96
-    let bprm_ptr: *const u8 = ctx.arg(0);
-    if !bprm_ptr.is_null() {
-        if let Ok(filename_ptr) = unsafe {
-            aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(96).cast::<*const u8>())
-        } {
-            if !filename_ptr.is_null() {
-                let mut buf = [0u8; 64];
-                if let Ok(bytes) = unsafe {
-                    aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut buf)
-                } {
-                    read_ok = true;
-                    debug_log(b"LSM_FENCE_KSTR", pid, ppid, bytes);
-                    if is_blocked(bytes) {
-                        blocked = true;
-                    }
-                } else if let Ok(bytes) = unsafe {
-                    aya_ebpf::helpers::bpf_probe_read_user_str_bytes(filename_ptr, &mut buf)
-                } {
-                    read_ok = true;
-                    debug_log(b"LSM_FENCE_USTR", pid, ppid, bytes);
-                    if is_blocked(bytes) {
-                        blocked = true;
-                    }
+    if let Ok(filename_ptr) = unsafe {
+        aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(96).cast::<*const u8>())
+    } {
+        if !filename_ptr.is_null() {
+            if let Ok(bytes) = unsafe {
+                aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(filename_ptr, &mut buf)
+            } {
+                if is_blocked(bytes) {
+                    blocked = true;
+                }
+            } else if let Ok(bytes) = unsafe {
+                aya_ebpf::helpers::bpf_probe_read_user_str_bytes(filename_ptr, &mut buf)
+            } {
+                if is_blocked(bytes) {
+                    blocked = true;
                 }
             }
         }
+    }
 
-        // Check 2: bprm->file->f_path.dentry->d_name.name
-        // bprm + 64 (file) -> file + 64 (f_path) -> f_path + 8 (dentry) -> dentry + 32 (d_name) -> qstr + 8 (name)
-        if !blocked {
-            if let Ok(file_ptr) = unsafe {
-                aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(64).cast::<*const u8>())
-            } {
-                if !file_ptr.is_null() {
-                    if let Ok(dentry_ptr) = unsafe {
-                        aya_ebpf::helpers::bpf_probe_read_kernel(file_ptr.add(72).cast::<*const u8>())
-                    } {
-                        if !dentry_ptr.is_null() {
-                            if let Ok(name_ptr) = unsafe {
-                                aya_ebpf::helpers::bpf_probe_read_kernel(dentry_ptr.add(40).cast::<*const u8>())
-                            } {
-                                if !name_ptr.is_null() {
-                                    let mut buf = [0u8; 32];
-                                    if let Ok(bytes) = unsafe {
-                                        aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf)
-                                    } {
-                                        read_ok = true;
-                                        debug_log(b"LSM_DENTRY", pid, ppid, bytes);
-                                        if is_blocked(bytes) {
-                                            blocked = true;
-                                        }
+    // Check 2: bprm->file->f_path.dentry->d_name.name
+    // bprm + 64 (file) -> file + 64 (f_path) -> f_path + 8 (dentry) -> dentry + 32 (d_name) -> qstr + 8 (name)
+    if !blocked {
+        if let Ok(file_ptr) = unsafe {
+            aya_ebpf::helpers::bpf_probe_read_kernel(bprm_ptr.add(64).cast::<*const u8>())
+        } {
+            if !file_ptr.is_null() {
+                if let Ok(dentry_ptr) = unsafe {
+                    aya_ebpf::helpers::bpf_probe_read_kernel(file_ptr.add(72).cast::<*const u8>())
+                } {
+                    if !dentry_ptr.is_null() {
+                        if let Ok(name_ptr) = unsafe {
+                            aya_ebpf::helpers::bpf_probe_read_kernel(dentry_ptr.add(40).cast::<*const u8>())
+                        } {
+                            if !name_ptr.is_null() {
+                                if let Ok(bytes) = unsafe {
+                                    aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf)
+                                } {
+                                    if is_blocked(bytes) {
+                                        blocked = true;
                                     }
                                 }
                             }
@@ -272,19 +241,6 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
                 }
             }
         }
-    }
-
-    // Check 3: Current task comm
-    if !blocked {
-        if let Ok(comm) = aya_ebpf::helpers::bpf_get_current_comm() {
-            if is_blocked(&comm) {
-                blocked = true;
-            }
-        }
-    }
-
-    if !read_ok {
-        debug_log(b"LSM_NO_READ", pid, ppid, b"cannot read filename");
     }
 
     if blocked {
