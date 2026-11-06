@@ -145,7 +145,19 @@ To maintain strict technical accuracy, the following architectural boundaries mu
 * `bpf-linker` (`cargo install bpf-linker`)
 * Root access (`sudo`) to attach LSM hooks
 
-### 1. Build from Source
+### Option A: Install Pre-Built Binary (Recommended)
+
+```bash
+# Download and extract the latest release
+curl -sSLO https://github.com/rxhtt/kerneleye/releases/download/v0.1.0/kerneleye-v0.1.0-x86_64-linux.tar.gz
+tar -xzf kerneleye-v0.1.0-x86_64-linux.tar.gz
+cd kerneleye-v0.1.0-x86_64-linux
+
+# Run the self-contained verification demo
+sudo ./run_demo.sh
+```
+
+### Option B: Build from Source
 ```bash
 # Clone the repository
 git clone https://github.com/rxhtt/kerneleye.git
