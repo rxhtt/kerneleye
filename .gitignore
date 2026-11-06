@@ -6,3 +6,5 @@ debug/
 target/
 **/*.rs.bk
 Cargo.lock
+__pycache__/
+*.pyc
