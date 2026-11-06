@@ -23,6 +23,9 @@ class KernelFence:
         block_binaries: Optional[List[str]] = None,
         block_files: Optional[List[str]] = None,
         audit_only: bool = False,
+        cryo_freeze: bool = False,
+        phantom_sink: bool = False,
+        honeypot_canary: bool = False,
         kill_on_violation: bool = True,
         daemon_path: Optional[str] = None,
     ):
@@ -37,8 +40,12 @@ class KernelFence:
             "authorized_keys",
         ]
         self.audit_only = audit_only
+        self.cryo_freeze = cryo_freeze
+        self.phantom_sink = phantom_sink
+        self.honeypot_canary = honeypot_canary
         self.kill_on_violation = kill_on_violation
         self._spawned_pgids: List[int] = []
+        self._canary_paths: List[str] = []
 
         # Resolve daemon binary path
         if daemon_path:
@@ -59,8 +66,18 @@ class KernelFence:
         self._proc: Optional[subprocess.Popen] = None
 
     def __enter__(self):
-        # If no specific PID is given, we fence on-demand per run_command
-        # to ensure the parent Python runner keeps full API connectivity.
+        if self.honeypot_canary:
+            canary_path = os.path.join(os.getcwd(), ".env.canary")
+            try:
+                with open(canary_path, "w") as f:
+                    f.write("# KernelEye Honeypot Canary Credential (Mirage VFS)\n")
+                    f.write("AWS_SECRET_ACCESS_KEY=AKIA_CANARY_TRUMAN_SHOW_99812_PROD_FAKE\n")
+                    f.write("OPENAI_API_KEY=sk-proj-canary-fake-token-never-leave-host-001\n")
+                    f.write("EXFIL_SINK_URL=http://127.0.0.1:65530/canary_exfil\n")
+                self._canary_paths.append(canary_path)
+            except Exception:
+                pass
+
         if self.target_pid is not None:
             self._start_daemon(self.target_pid)
         return self
@@ -78,8 +95,13 @@ class KernelFence:
         ]
         if self.audit_only:
             cmd.append("--audit-only")
+        elif self.cryo_freeze:
+            cmd.append("--cryo-freeze")
         elif self.kill_on_violation:
             cmd.append("--kill-on-violation")
+
+        if self.phantom_sink:
+            cmd.append("--phantom-sink")
 
         self._proc = subprocess.Popen(
             cmd,
@@ -155,7 +177,16 @@ class KernelFence:
                 pass
         self._spawned_pgids.clear()
 
-        # 2. Stop daemon
+        # 2. Clean up canary honeypot files
+        for path in self._canary_paths:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+        self._canary_paths.clear()
+
+        # 3. Stop daemon
         if self._proc:
             try:
                 self._proc.terminate()

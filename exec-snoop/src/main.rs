@@ -28,6 +28,14 @@ struct Opt {
     /// Run in audit-only mode: log confinement violations to telemetry without blocking operations.
     #[arg(long = "audit-only")]
     audit_only: bool,
+
+    /// Freeze the offending process tree in RAM (SIGSTOP) instead of terminating it, preserving state for inspection.
+    #[arg(long = "cryo-freeze")]
+    cryo_freeze: bool,
+
+    /// Launch active counter-deception Phantom Sinkhole on 127.0.0.1:65530 (captures exfiltration & returns HTTP 200).
+    #[arg(long = "phantom-sink")]
+    phantom_sink: bool,
 }
 
 fn format_time() -> String {
@@ -240,6 +248,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Consume initial tick so interval fires 5s from now
     drop_interval.tick().await;
 
+    if _opt.phantom_sink {
+        tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind("127.0.0.1:65530").await {
+                Ok(l) => {
+                    println!("[+] Mirage Egress: Phantom Sinkhole active on 127.0.0.1:65530 (Counter-Deception)");
+                    l
+                }
+                Err(e) => {
+                    eprintln!("[!] Failed to bind Phantom Sinkhole to 127.0.0.1:65530: {e}");
+                    return;
+                }
+            };
+
+            loop {
+                if let Ok((mut socket, addr)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 4096];
+                        if let Ok(n) = socket.read(&mut buf).await {
+                            if n > 0 {
+                                let payload = String::from_utf8_lossy(&buf[..n]);
+                                let first_line = payload.lines().next().unwrap_or("");
+                                eprintln!(
+                                    "[PHANTOM SINKHOLE] Intercepted exfiltration payload from {addr}: {first_line}"
+                                );
+                                if payload.contains("AKIA") || payload.contains("CANARY") || payload.contains("token") {
+                                    eprintln!("[PHANTOM SINKHOLE FORENSICS] Honeypot Canary Token detected in payload!");
+                                }
+                                let http_response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}\n";
+                                let _ = socket.write_all(http_response.as_bytes()).await;
+                            }
+                        }
+                    });
+                }
+            }
+        });
+    }
+
     loop {
         tokio::select! {
             _ = signal::ctrl_c() => {
@@ -277,7 +323,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             event.timestamp_ns, event.agent_pid, event.child_pid, comm_str, bin_str
                         );
 
-                        if _opt.kill_on_violation && event.agent_pid > 0 {
+                        if _opt.cryo_freeze && event.agent_pid > 0 {
+                            eprintln!(
+                                "[CRYO-FREEZE] Confinement violation trapped: {} ({})",
+                                bin_str, comm_str
+                            );
+                            eprintln!(
+                                "[CRYO-FREEZE] Process tree suspended in RAM (SIGSTOP): Root PID {} | Worker PID {}",
+                                event.agent_pid, event.child_pid
+                            );
+                            unsafe {
+                                libc::kill(event.child_pid as libc::pid_t, libc::SIGSTOP);
+                                libc::kill(event.agent_pid as libc::pid_t, libc::SIGSTOP);
+                            }
+                        } else if _opt.kill_on_violation && event.agent_pid > 0 {
                             eprintln!(
                                 "[KILL-SWITCH] Terminating fenced root agent session PID {} with SIGKILL...",
                                 event.agent_pid
