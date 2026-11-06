@@ -13,7 +13,7 @@ use exec_snoop_common::{
 };
 
 mod vmlinux;
-use vmlinux::{linux_binprm, sockaddr, task_struct};
+use vmlinux::{dentry, file, linux_binprm, msghdr, sockaddr, socket, task_struct};
 
 macro_rules! bpf_core_read {
     ($target:expr) => {
@@ -35,6 +35,9 @@ static PROTECTED_AGENT_PIDS: HashMap<u32, u32> = HashMap::with_max_entries(MAX_A
 
 #[map]
 static BLOCKED_BINARIES: HashMap<[u8; 16], u8> = HashMap::with_max_entries(64, 0);
+
+#[map]
+static BLOCKED_FILES: HashMap<[u8; 16], u8> = HashMap::with_max_entries(64, 0);
 
 #[tracepoint]
 pub fn exec_snoop(ctx: TracePointContext) -> u32 {
@@ -326,6 +329,110 @@ pub fn socket_connect(ctx: LsmContext) -> i32 {
                 emit_violation(fenced_root_pid, current_pid, comm, b"network:socket_connect\0");
                 return -1; // -EPERM
             }
+        }
+    }
+
+    0
+}
+
+#[lsm(hook = "socket_sendmsg")]
+pub fn socket_sendmsg(ctx: LsmContext) -> i32 {
+    let pid_tgid = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+    let current_tgid = (pid_tgid >> 32) as u32;
+    let current_pid = pid_tgid as u32;
+
+    let fenced_root_pid = get_fenced_root_pid(current_tgid, current_pid);
+    if fenced_root_pid == 0 {
+        return 0;
+    }
+
+    // Auto-propagate fenced state
+    let _ = PROTECTED_AGENT_PIDS.insert(&current_tgid, &1, 0);
+    let _ = PROTECTED_AGENT_PIDS.insert(&current_pid, &1, 0);
+
+    // Arg 0: sock (*const socket)
+    // Arg 1: msg (*const msghdr)
+    let sock: *const socket = ctx.arg(0);
+    let msg: *const msghdr = ctx.arg(1);
+
+    // Check msg->msg_name for connectionless UDP (sendto)
+    if !msg.is_null() {
+        if let Ok(name_ptr) = unsafe { bpf_core_read!((*msg).msg_name) } {
+            if !name_ptr.is_null() {
+                let addr = name_ptr as *const sockaddr;
+                if let Ok(family) = unsafe { bpf_core_read!((*addr).sa_family) } {
+                    if family == 2 || family == 10 {
+                        let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
+                        emit_violation(fenced_root_pid, current_pid, comm, b"network:socket_sendmsg\0");
+                        return -1; // -EPERM
+                    }
+                }
+            }
+        }
+    }
+
+    // Check sock->sk->skc_family
+    if !sock.is_null() {
+        if let Ok(sk) = unsafe { bpf_core_read!((*sock).sk) } {
+            if !sk.is_null() {
+                if let Ok(family) = unsafe { bpf_core_read!((*sk).skc_family) } {
+                    if family == 2 || family == 10 {
+                        let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
+                        emit_violation(fenced_root_pid, current_pid, comm, b"network:socket_sendmsg\0");
+                        return -1; // -EPERM
+                    }
+                }
+            }
+        }
+    }
+
+    0
+}
+
+#[lsm(hook = "file_open")]
+pub fn file_open(ctx: LsmContext) -> i32 {
+    let pid_tgid = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+    let current_tgid = (pid_tgid >> 32) as u32;
+    let current_pid = pid_tgid as u32;
+
+    let fenced_root_pid = get_fenced_root_pid(current_tgid, current_pid);
+    if fenced_root_pid == 0 {
+        return 0;
+    }
+
+    // Auto-propagate fenced state
+    let _ = PROTECTED_AGENT_PIDS.insert(&current_tgid, &1, 0);
+    let _ = PROTECTED_AGENT_PIDS.insert(&current_pid, &1, 0);
+
+    // Arg 0: file (*const file)
+    let file: *const file = ctx.arg(0);
+    if file.is_null() {
+        return 0;
+    }
+
+    let dentry: *const dentry = match unsafe { bpf_core_read!((*file).f_path.dentry) } {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+    if dentry.is_null() {
+        return 0;
+    }
+
+    let name_ptr: *const u8 = match unsafe { bpf_core_read!((*dentry).d_name.name) } {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    if name_ptr.is_null() {
+        return 0;
+    }
+
+    let mut buf = [0u8; 32];
+    if let Ok(slice) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf) } {
+        let key = extract_basename_key(slice);
+        if unsafe { BLOCKED_FILES.get(&key).is_some() } {
+            let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
+            emit_violation(fenced_root_pid, current_pid, comm, slice);
+            return -13; // -EACCES (Permission Denied)
         }
     }
 

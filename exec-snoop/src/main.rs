@@ -20,6 +20,10 @@ struct Opt {
     /// Comma-separated list of unauthorized binary basenames to block for fenced agents.
     #[arg(long = "block", default_value = "curl,wget,nc,ncat,socat")]
     block: String,
+
+    /// Comma-separated list of sensitive file basenames to block for fenced agents.
+    #[arg(long = "block-files", default_value = "id_rsa,id_ed25519,credentials,.env,shadow,authorized_keys")]
+    block_files: String,
 }
 
 fn format_time() -> String {
@@ -139,6 +143,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if let Some(prog) = bpf.program_mut("socket_sendmsg") {
+        match Btf::from_sys_fs() {
+            Ok(btf) => {
+                let lsm_program: Result<&mut Lsm, _> = prog.try_into();
+                match lsm_program {
+                    Ok(lsm_prog) => match lsm_prog.load("socket_sendmsg", &btf) {
+                        Ok(()) => match lsm_prog.attach() {
+                            Ok(_) => println!("[+] eBPF LSM hook attached to socket_sendmsg (blocking connectionless UDP / egress)"),
+                            Err(e) => eprintln!("[!] Failed to attach socket_sendmsg hook: {e}"),
+                        },
+                        Err(e) => eprintln!("[!] Failed to load socket_sendmsg program: {e}"),
+                    },
+                    Err(e) => eprintln!("[!] Failed to convert socket_sendmsg to Lsm: {e}"),
+                }
+            }
+            Err(e) => eprintln!("[!] Failed to read BTF from sysfs for socket_sendmsg: {e}"),
+        }
+    }
+
+    if let Some(prog) = bpf.program_mut("file_open") {
+        match Btf::from_sys_fs() {
+            Ok(btf) => {
+                let lsm_program: Result<&mut Lsm, _> = prog.try_into();
+                match lsm_program {
+                    Ok(lsm_prog) => match lsm_prog.load("file_open", &btf) {
+                        Ok(()) => match lsm_prog.attach() {
+                            Ok(_) => println!("[+] eBPF LSM hook attached to file_open (blocking sensitive credential access)"),
+                            Err(e) => eprintln!("[!] Failed to attach file_open hook: {e}"),
+                        },
+                        Err(e) => eprintln!("[!] Failed to load file_open program: {e}"),
+                    },
+                    Err(e) => eprintln!("[!] Failed to convert file_open to Lsm: {e}"),
+                }
+            }
+            Err(e) => eprintln!("[!] Failed to read BTF from sysfs for file_open: {e}"),
+        }
+    }
+
     if let Some(map) = bpf.map_mut("BLOCKED_BINARIES") {
         if let Ok(mut blocked_map) = HashMap::<_, [u8; 16], u8>::try_from(map) {
             for raw_name in _opt.block.split(',') {
@@ -155,6 +197,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             println!("[+] Populated BLOCKED_BINARIES policy: {}", _opt.block);
+        }
+    }
+
+    if let Some(map) = bpf.map_mut("BLOCKED_FILES") {
+        if let Ok(mut blocked_map) = HashMap::<_, [u8; 16], u8>::try_from(map) {
+            for raw_name in _opt.block_files.split(',') {
+                let name = raw_name.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                let mut key = [0u8; 16];
+                let bytes = name.as_bytes();
+                let len = bytes.len().min(15);
+                key[..len].copy_from_slice(&bytes[..len]);
+                if let Err(e) = blocked_map.insert(key, 1, 0) {
+                    eprintln!("[!] Failed to insert '{name}' into BLOCKED_FILES map: {e}");
+                }
+            }
+            println!("[+] Populated BLOCKED_FILES policy: {}", _opt.block_files);
         }
     }
 

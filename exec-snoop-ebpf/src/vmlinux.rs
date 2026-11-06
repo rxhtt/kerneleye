@@ -41,3 +41,46 @@ pub struct sockaddr_in6 {
     pub sin6_scope_id: u32,
 }
 
+#[repr(C)]
+pub struct msghdr {
+    pub msg_name: *const u8,
+    pub msg_namelen: i32,
+}
+
+#[repr(C)]
+pub struct socket {
+    pub _pad0: [u8; 32],
+    pub sk: *const sock,
+}
+
+#[repr(C)]
+pub struct sock {
+    pub _pad0: [u8; 16],
+    pub skc_family: u16,
+}
+
+#[repr(C)]
+pub struct qstr {
+    pub _pad0: [u8; 8],
+    pub name: *const u8,
+}
+
+#[repr(C)]
+pub struct dentry {
+    pub _pad0: [u8; 32],
+    pub d_name: qstr,
+}
+
+#[repr(C)]
+pub struct path {
+    pub _pad0: [u8; 8],
+    pub dentry: *const dentry,
+}
+
+#[repr(C)]
+pub struct file {
+    pub _pad0: [u8; 64],
+    pub f_path: path,
+}
+
+
