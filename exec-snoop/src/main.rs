@@ -1,4 +1,4 @@
-use aya::maps::{HashMap, PerCpuArray, RingBuf};
+use aya::maps::{Array, HashMap, PerCpuArray, RingBuf};
 use aya::programs::{Lsm, TracePoint};
 use aya::Btf;
 use clap::Parser;
@@ -24,6 +24,10 @@ struct Opt {
     /// Comma-separated list of sensitive file basenames to block for fenced agents.
     #[arg(long = "block-files", default_value = "id_rsa,id_ed25519,credentials,.env,shadow,authorized_keys")]
     block_files: String,
+
+    /// Run in audit-only mode: log confinement violations to telemetry without blocking operations.
+    #[arg(long = "audit-only")]
+    audit_only: bool,
 }
 
 fn format_time() -> String {
@@ -105,79 +109,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if let Some(prog) = bpf.program_mut("bprm_check_security") {
-        match Btf::from_sys_fs() {
-            Ok(btf) => {
+    let btf = match Btf::from_sys_fs() {
+        Ok(b) => Some(b),
+        Err(e) => {
+            eprintln!("[!] Failed to read BTF from sysfs: {e}");
+            None
+        }
+    };
+
+    if let Some(ref btf) = btf {
+        let lsm_hooks = [
+            ("bprm_check_security", "blocking configured binaries"),
+            ("socket_connect", "blocking AF_INET/AF_INET6 egress"),
+            ("socket_sendmsg", "blocking connectionless UDP / datagram egress"),
+            ("file_open", "blocking sensitive credential file access"),
+            ("task_kill", "anti-tamper: preventing rogue processes from signaling daemon"),
+            ("ptrace_access_check", "anti-tamper: preventing ptrace of unfenced processes"),
+            ("inode_link", "anti-evasion: blocking hard links to sensitive files"),
+            ("inode_rename", "anti-evasion: blocking renames of sensitive files"),
+            ("inode_unlink", "workspace guard: blocking deletion of critical files"),
+        ];
+
+        for (hook_name, desc) in lsm_hooks {
+            if let Some(prog) = bpf.program_mut(hook_name) {
                 let lsm_program: Result<&mut Lsm, _> = prog.try_into();
                 match lsm_program {
-                    Ok(lsm_prog) => match lsm_prog.load("bprm_check_security", &btf) {
+                    Ok(lsm_prog) => match lsm_prog.load(hook_name, btf) {
                         Ok(()) => match lsm_prog.attach() {
-                            Ok(_) => println!("[+] eBPF LSM hook attached to bprm_check_security (blocking configured binaries)"),
-                            Err(e) => eprintln!("[!] Failed to attach LSM hook: {e}"),
+                            Ok(_) => println!("[+] eBPF LSM hook attached: {hook_name} ({desc})"),
+                            Err(e) => eprintln!("[!] Failed to attach LSM hook {hook_name}: {e}"),
                         },
-                        Err(e) => eprintln!("[!] Failed to load LSM program: {e}"),
+                        Err(e) => eprintln!("[!] Failed to load LSM program {hook_name}: {e}"),
                     },
-                    Err(e) => eprintln!("[!] Failed to convert program to Lsm: {e}"),
+                    Err(e) => eprintln!("[!] Failed to convert {hook_name} to Lsm: {e}"),
                 }
             }
-            Err(e) => eprintln!("[!] Failed to read BTF from sysfs: {e}"),
         }
     }
 
-    if let Some(prog) = bpf.program_mut("socket_connect") {
-        match Btf::from_sys_fs() {
-            Ok(btf) => {
-                let lsm_program: Result<&mut Lsm, _> = prog.try_into();
-                match lsm_program {
-                    Ok(lsm_prog) => match lsm_prog.load("socket_connect", &btf) {
-                        Ok(()) => match lsm_prog.attach() {
-                            Ok(_) => println!("[+] eBPF LSM hook attached to socket_connect (blocking AF_INET/AF_INET6 egress)"),
-                            Err(e) => eprintln!("[!] Failed to attach socket_connect hook: {e}"),
-                        },
-                        Err(e) => eprintln!("[!] Failed to load socket_connect program: {e}"),
-                    },
-                    Err(e) => eprintln!("[!] Failed to convert socket_connect to Lsm: {e}"),
-                }
+    if let Some(map) = bpf.map_mut("AUDIT_MODE") {
+        if let Ok(mut audit_map) = Array::<_, u8>::try_from(map) {
+            let val: u8 = if _opt.audit_only { 1 } else { 0 };
+            let _ = audit_map.set(0, val, 0);
+            if _opt.audit_only {
+                println!("[*] AUDIT MODE ACTIVE: Violations will be logged without blocking.");
             }
-            Err(e) => eprintln!("[!] Failed to read BTF from sysfs for socket_connect: {e}"),
         }
     }
 
-    if let Some(prog) = bpf.program_mut("socket_sendmsg") {
-        match Btf::from_sys_fs() {
-            Ok(btf) => {
-                let lsm_program: Result<&mut Lsm, _> = prog.try_into();
-                match lsm_program {
-                    Ok(lsm_prog) => match lsm_prog.load("socket_sendmsg", &btf) {
-                        Ok(()) => match lsm_prog.attach() {
-                            Ok(_) => println!("[+] eBPF LSM hook attached to socket_sendmsg (blocking connectionless UDP / egress)"),
-                            Err(e) => eprintln!("[!] Failed to attach socket_sendmsg hook: {e}"),
-                        },
-                        Err(e) => eprintln!("[!] Failed to load socket_sendmsg program: {e}"),
-                    },
-                    Err(e) => eprintln!("[!] Failed to convert socket_sendmsg to Lsm: {e}"),
-                }
-            }
-            Err(e) => eprintln!("[!] Failed to read BTF from sysfs for socket_sendmsg: {e}"),
-        }
-    }
-
-    if let Some(prog) = bpf.program_mut("file_open") {
-        match Btf::from_sys_fs() {
-            Ok(btf) => {
-                let lsm_program: Result<&mut Lsm, _> = prog.try_into();
-                match lsm_program {
-                    Ok(lsm_prog) => match lsm_prog.load("file_open", &btf) {
-                        Ok(()) => match lsm_prog.attach() {
-                            Ok(_) => println!("[+] eBPF LSM hook attached to file_open (blocking sensitive credential access)"),
-                            Err(e) => eprintln!("[!] Failed to attach file_open hook: {e}"),
-                        },
-                        Err(e) => eprintln!("[!] Failed to load file_open program: {e}"),
-                    },
-                    Err(e) => eprintln!("[!] Failed to convert file_open to Lsm: {e}"),
-                }
-            }
-            Err(e) => eprintln!("[!] Failed to read BTF from sysfs for file_open: {e}"),
+    if let Some(map) = bpf.map_mut("DAEMON_PID") {
+        if let Ok(mut daemon_map) = Array::<_, u32>::try_from(map) {
+            let my_pid = std::process::id();
+            let _ = daemon_map.set(0, my_pid, 0);
+            println!("[+] Anti-tamper active: Protected daemon PID {my_pid} against signals");
         }
     }
 

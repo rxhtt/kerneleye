@@ -4,7 +4,7 @@
 use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid},
     macros::{lsm, map, tracepoint},
-    maps::{HashMap, PerCpuArray, RingBuf},
+    maps::{Array, HashMap, PerCpuArray, RingBuf},
     programs::{LsmContext, TracePointContext},
     EbpfContext,
 };
@@ -38,6 +38,21 @@ static BLOCKED_BINARIES: HashMap<[u8; 16], u8> = HashMap::with_max_entries(64, 0
 
 #[map]
 static BLOCKED_FILES: HashMap<[u8; 16], u8> = HashMap::with_max_entries(64, 0);
+
+#[map]
+static AUDIT_MODE: Array<u8> = Array::with_max_entries(1, 0);
+
+#[map]
+static DAEMON_PID: Array<u32> = Array::with_max_entries(1, 0);
+
+#[inline(always)]
+fn is_audit_mode() -> bool {
+    if let Some(val) = AUDIT_MODE.get(0) {
+        *val != 0
+    } else {
+        false
+    }
+}
 
 #[tracepoint]
 pub fn exec_snoop(ctx: TracePointContext) -> u32 {
@@ -273,6 +288,9 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
             || (comm[0] == b'c' && comm[1] == b'u' && comm[2] == b'r' && comm[3] == b'l')
         {
             emit_violation(fenced_root_pid, current_pid, comm, b"curl\0");
+            if is_audit_mode() {
+                return 0;
+            }
             return -1; // -EPERM
         }
     }
@@ -287,6 +305,9 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
                 if is_blocked_binary(bytes) {
                     let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
                     emit_violation(fenced_root_pid, current_pid, comm, bytes);
+                    if is_audit_mode() {
+                        return 0;
+                    }
                     return -1; // -EPERM
                 }
             } else if let Ok(bytes) = unsafe {
@@ -295,6 +316,9 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
                 if is_blocked_binary(bytes) {
                     let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
                     emit_violation(fenced_root_pid, current_pid, comm, bytes);
+                    if is_audit_mode() {
+                        return 0;
+                    }
                     return -1; // -EPERM
                 }
             }
@@ -327,6 +351,9 @@ pub fn socket_connect(ctx: LsmContext) -> i32 {
             if family == 2 || family == 10 {
                 let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
                 emit_violation(fenced_root_pid, current_pid, comm, b"network:socket_connect\0");
+                if is_audit_mode() {
+                    return 0;
+                }
                 return -1; // -EPERM
             }
         }
@@ -364,6 +391,9 @@ pub fn socket_sendmsg(ctx: LsmContext) -> i32 {
                     if family == 2 || family == 10 {
                         let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
                         emit_violation(fenced_root_pid, current_pid, comm, b"network:socket_sendmsg\0");
+                        if is_audit_mode() {
+                            return 0;
+                        }
                         return -1; // -EPERM
                     }
                 }
@@ -379,6 +409,9 @@ pub fn socket_sendmsg(ctx: LsmContext) -> i32 {
                     if family == 2 || family == 10 {
                         let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
                         emit_violation(fenced_root_pid, current_pid, comm, b"network:socket_sendmsg\0");
+                        if is_audit_mode() {
+                            return 0;
+                        }
                         return -1; // -EPERM
                     }
                 }
@@ -432,7 +465,209 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         if unsafe { BLOCKED_FILES.get(&key).is_some() } {
             let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
             emit_violation(fenced_root_pid, current_pid, comm, slice);
+            if is_audit_mode() {
+                return 0;
+            }
             return -13; // -EACCES (Permission Denied)
+        }
+    }
+
+    0
+}
+
+#[lsm(hook = "task_kill")]
+pub fn task_kill(ctx: LsmContext) -> i32 {
+    let pid_tgid = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+    let current_tgid = (pid_tgid >> 32) as u32;
+    let current_pid = pid_tgid as u32;
+
+    let fenced_root_pid = get_fenced_root_pid(current_tgid, current_pid);
+    if fenced_root_pid == 0 {
+        return 0;
+    }
+
+    let target_task: *const task_struct = ctx.arg(0);
+    if target_task.is_null() {
+        return 0;
+    }
+
+    let target_tgid = match unsafe { bpf_core_read!((*target_task).tgid) } {
+        Ok(v) => v,
+        Err(_) => 0,
+    };
+    let target_pid = match unsafe { bpf_core_read!((*target_task).pid) } {
+        Ok(v) => v,
+        Err(_) => 0,
+    };
+
+    if let Some(daemon_pid) = DAEMON_PID.get(0) {
+        if *daemon_pid > 0 && (target_tgid == *daemon_pid || target_pid == *daemon_pid) {
+            let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
+            emit_violation(fenced_root_pid, current_pid, comm, b"anti_tamper:task_kill\0");
+            if is_audit_mode() {
+                return 0;
+            }
+            return -1; // -EPERM
+        }
+    }
+
+    0
+}
+
+#[lsm(hook = "ptrace_access_check")]
+pub fn ptrace_access_check(ctx: LsmContext) -> i32 {
+    let pid_tgid = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+    let current_tgid = (pid_tgid >> 32) as u32;
+    let current_pid = pid_tgid as u32;
+
+    let fenced_root_pid = get_fenced_root_pid(current_tgid, current_pid);
+    if fenced_root_pid == 0 {
+        return 0;
+    }
+
+    let child_task: *const task_struct = ctx.arg(0);
+    if child_task.is_null() {
+        return 0;
+    }
+
+    let child_tgid = match unsafe { bpf_core_read!((*child_task).tgid) } {
+        Ok(v) => v,
+        Err(_) => 0,
+    };
+    let child_pid = match unsafe { bpf_core_read!((*child_task).pid) } {
+        Ok(v) => v,
+        Err(_) => 0,
+    };
+
+    let target_is_fenced = (child_tgid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&child_tgid).is_some() })
+        || (child_pid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&child_pid).is_some() });
+
+    if !target_is_fenced {
+        let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
+        emit_violation(fenced_root_pid, current_pid, comm, b"anti_tamper:ptrace\0");
+        if is_audit_mode() {
+            return 0;
+        }
+        return -1; // -EPERM
+    }
+
+    0
+}
+
+#[lsm(hook = "inode_link")]
+pub fn inode_link(ctx: LsmContext) -> i32 {
+    let pid_tgid = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+    let current_tgid = (pid_tgid >> 32) as u32;
+    let current_pid = pid_tgid as u32;
+
+    let fenced_root_pid = get_fenced_root_pid(current_tgid, current_pid);
+    if fenced_root_pid == 0 {
+        return 0;
+    }
+
+    let old_dentry: *const dentry = ctx.arg(0);
+    if old_dentry.is_null() {
+        return 0;
+    }
+
+    let name_ptr: *const u8 = match unsafe { bpf_core_read!((*old_dentry).d_name.name) } {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    if name_ptr.is_null() {
+        return 0;
+    }
+
+    let mut buf = [0u8; 32];
+    if let Ok(slice) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf) } {
+        let key = extract_basename_key(slice);
+        if unsafe { BLOCKED_FILES.get(&key).is_some() } {
+            let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
+            emit_violation(fenced_root_pid, current_pid, comm, b"evasion:hardlink\0");
+            if is_audit_mode() {
+                return 0;
+            }
+            return -1; // -EPERM
+        }
+    }
+
+    0
+}
+
+#[lsm(hook = "inode_rename")]
+pub fn inode_rename(ctx: LsmContext) -> i32 {
+    let pid_tgid = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+    let current_tgid = (pid_tgid >> 32) as u32;
+    let current_pid = pid_tgid as u32;
+
+    let fenced_root_pid = get_fenced_root_pid(current_tgid, current_pid);
+    if fenced_root_pid == 0 {
+        return 0;
+    }
+
+    let old_dentry: *const dentry = ctx.arg(1);
+    if old_dentry.is_null() {
+        return 0;
+    }
+
+    let name_ptr: *const u8 = match unsafe { bpf_core_read!((*old_dentry).d_name.name) } {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    if name_ptr.is_null() {
+        return 0;
+    }
+
+    let mut buf = [0u8; 32];
+    if let Ok(slice) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf) } {
+        let key = extract_basename_key(slice);
+        if unsafe { BLOCKED_FILES.get(&key).is_some() } {
+            let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
+            emit_violation(fenced_root_pid, current_pid, comm, b"evasion:rename\0");
+            if is_audit_mode() {
+                return 0;
+            }
+            return -1; // -EPERM
+        }
+    }
+
+    0
+}
+
+#[lsm(hook = "inode_unlink")]
+pub fn inode_unlink(ctx: LsmContext) -> i32 {
+    let pid_tgid = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+    let current_tgid = (pid_tgid >> 32) as u32;
+    let current_pid = pid_tgid as u32;
+
+    let fenced_root_pid = get_fenced_root_pid(current_tgid, current_pid);
+    if fenced_root_pid == 0 {
+        return 0;
+    }
+
+    let dentry: *const dentry = ctx.arg(1);
+    if dentry.is_null() {
+        return 0;
+    }
+
+    let name_ptr: *const u8 = match unsafe { bpf_core_read!((*dentry).d_name.name) } {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    if name_ptr.is_null() {
+        return 0;
+    }
+
+    let mut buf = [0u8; 32];
+    if let Ok(slice) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf) } {
+        let key = extract_basename_key(slice);
+        if unsafe { BLOCKED_FILES.get(&key).is_some() } {
+            let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
+            emit_violation(fenced_root_pid, current_pid, comm, b"destruct:unlink\0");
+            if is_audit_mode() {
+                return 0;
+            }
+            return -1; // -EPERM
         }
     }
 
