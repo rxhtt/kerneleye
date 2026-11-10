@@ -2,14 +2,14 @@
 #![no_main]
 
 use aya_ebpf::{
+    EbpfContext,
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid},
     macros::{lsm, map, tracepoint},
     maps::{Array, HashMap, PerCpuArray, RingBuf},
     programs::{LsmContext, TracePointContext},
-    EbpfContext,
 };
 use exec_snoop_common::{
-    ConfinementViolationEvent, ProcessExecEvent, MAX_AGENT_PIDS, MAX_ARGS_LEN,
+    ConfinementViolationEvent, MAX_AGENT_PIDS, MAX_ARGS_LEN, ProcessExecEvent,
 };
 
 mod vmlinux;
@@ -78,7 +78,10 @@ fn try_process_fork(ctx: TracePointContext) -> Result<(), u32> {
     let is_parent_fenced = unsafe {
         PROTECTED_AGENT_PIDS.get(&current_tgid).is_some()
             || PROTECTED_AGENT_PIDS.get(&current_pid).is_some()
-            || ctx.read_at::<u32>(12).map(|p| PROTECTED_AGENT_PIDS.get(&p).is_some()).unwrap_or(false)
+            || ctx
+                .read_at::<u32>(12)
+                .map(|p| PROTECTED_AGENT_PIDS.get(&p).is_some())
+                .unwrap_or(false)
     };
 
     if is_parent_fenced {
@@ -129,9 +132,13 @@ fn try_exec_snoop(ctx: TracePointContext) -> Result<u32, u32> {
         if offset > 0 {
             let str_ptr = unsafe { (ctx.as_ptr() as *const u8).add(offset) };
             #[allow(deprecated)]
-            if let Ok(len) = unsafe { aya_ebpf::helpers::bpf_probe_read_user_str(str_ptr, &mut args) } {
+            if let Ok(len) =
+                unsafe { aya_ebpf::helpers::bpf_probe_read_user_str(str_ptr, &mut args) }
+            {
                 args_len = len;
-            } else if let Ok(bytes) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(str_ptr, &mut args) } {
+            } else if let Ok(bytes) =
+                unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(str_ptr, &mut args) }
+            {
                 args_len = bytes.len();
             }
         }
@@ -310,9 +317,9 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
                     }
                     return -1; // -EPERM
                 }
-            } else if let Ok(bytes) = unsafe {
-                aya_ebpf::helpers::bpf_probe_read_user_str_bytes(filename_ptr, &mut buf)
-            } {
+            } else if let Ok(bytes) =
+                unsafe { aya_ebpf::helpers::bpf_probe_read_user_str_bytes(filename_ptr, &mut buf) }
+            {
                 if is_blocked_binary(bytes) {
                     let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
                     emit_violation(fenced_root_pid, current_pid, comm, bytes);
@@ -350,7 +357,12 @@ pub fn socket_connect(ctx: LsmContext) -> i32 {
             // AF_INET = 2, AF_INET6 = 10
             if family == 2 || family == 10 {
                 let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
-                emit_violation(fenced_root_pid, current_pid, comm, b"network:socket_connect\0");
+                emit_violation(
+                    fenced_root_pid,
+                    current_pid,
+                    comm,
+                    b"network:socket_connect\0",
+                );
                 if is_audit_mode() {
                     return 0;
                 }
@@ -390,7 +402,12 @@ pub fn socket_sendmsg(ctx: LsmContext) -> i32 {
                 if let Ok(family) = unsafe { bpf_core_read!((*addr).sa_family) } {
                     if family == 2 || family == 10 {
                         let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
-                        emit_violation(fenced_root_pid, current_pid, comm, b"network:socket_sendmsg\0");
+                        emit_violation(
+                            fenced_root_pid,
+                            current_pid,
+                            comm,
+                            b"network:socket_sendmsg\0",
+                        );
                         if is_audit_mode() {
                             return 0;
                         }
@@ -408,7 +425,12 @@ pub fn socket_sendmsg(ctx: LsmContext) -> i32 {
                 if let Ok(family) = unsafe { bpf_core_read!((*sk).skc_family) } {
                     if family == 2 || family == 10 {
                         let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
-                        emit_violation(fenced_root_pid, current_pid, comm, b"network:socket_sendmsg\0");
+                        emit_violation(
+                            fenced_root_pid,
+                            current_pid,
+                            comm,
+                            b"network:socket_sendmsg\0",
+                        );
                         if is_audit_mode() {
                             return 0;
                         }
@@ -460,7 +482,9 @@ pub fn file_open(ctx: LsmContext) -> i32 {
     }
 
     let mut buf = [0u8; 32];
-    if let Ok(slice) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf) } {
+    if let Ok(slice) =
+        unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf) }
+    {
         let key = extract_basename_key(slice);
         if unsafe { BLOCKED_FILES.get(&key).is_some() } {
             let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
@@ -503,7 +527,12 @@ pub fn task_kill(ctx: LsmContext) -> i32 {
     if let Some(daemon_pid) = DAEMON_PID.get(0) {
         if *daemon_pid > 0 && (target_tgid == *daemon_pid || target_pid == *daemon_pid) {
             let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
-            emit_violation(fenced_root_pid, current_pid, comm, b"anti_tamper:task_kill\0");
+            emit_violation(
+                fenced_root_pid,
+                current_pid,
+                comm,
+                b"anti_tamper:task_kill\0",
+            );
             if is_audit_mode() {
                 return 0;
             }
@@ -539,7 +568,8 @@ pub fn ptrace_access_check(ctx: LsmContext) -> i32 {
         Err(_) => 0,
     };
 
-    let target_is_fenced = (child_tgid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&child_tgid).is_some() })
+    let target_is_fenced = (child_tgid > 0
+        && unsafe { PROTECTED_AGENT_PIDS.get(&child_tgid).is_some() })
         || (child_pid > 0 && unsafe { PROTECTED_AGENT_PIDS.get(&child_pid).is_some() });
 
     if !target_is_fenced {
@@ -579,7 +609,9 @@ pub fn inode_link(ctx: LsmContext) -> i32 {
     }
 
     let mut buf = [0u8; 32];
-    if let Ok(slice) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf) } {
+    if let Ok(slice) =
+        unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf) }
+    {
         let key = extract_basename_key(slice);
         if unsafe { BLOCKED_FILES.get(&key).is_some() } {
             let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
@@ -619,7 +651,9 @@ pub fn inode_rename(ctx: LsmContext) -> i32 {
     }
 
     let mut buf = [0u8; 32];
-    if let Ok(slice) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf) } {
+    if let Ok(slice) =
+        unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf) }
+    {
         let key = extract_basename_key(slice);
         if unsafe { BLOCKED_FILES.get(&key).is_some() } {
             let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
@@ -659,7 +693,9 @@ pub fn inode_unlink(ctx: LsmContext) -> i32 {
     }
 
     let mut buf = [0u8; 32];
-    if let Ok(slice) = unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf) } {
+    if let Ok(slice) =
+        unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_str_bytes(name_ptr, &mut buf) }
+    {
         let key = extract_basename_key(slice);
         if unsafe { BLOCKED_FILES.get(&key).is_some() } {
             let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);

@@ -17,12 +17,22 @@ echo -e "${BOLD}================================================================
 echo ""
 
 # Check release binary artifact
-if [ ! -f "target/release/exec-snoop" ]; then
+DAEMON_BIN=""
+if [ -f "target/release/kerneleye" ]; then
+    DAEMON_BIN="target/release/kerneleye"
+elif [ -f "target/release/exec-snoop" ]; then
+    DAEMON_BIN="target/release/exec-snoop"
+else
     echo -e "${YELLOW}[*] Building release binary with throttled concurrency (-j 2)...${RESET}"
     cargo xtask build --release -j 2
+    if [ -f "target/release/kerneleye" ]; then
+        DAEMON_BIN="target/release/kerneleye"
+    else
+        DAEMON_BIN="target/release/exec-snoop"
+    fi
 fi
 
-SCRIPT_PATH="scripts/mock_compromised_agent.py"
+SCRIPT_PATH="examples/compromised_agent.py"
 if [ ! -f "$SCRIPT_PATH" ]; then
     echo -e "${RED}[-] Error: $SCRIPT_PATH not found.${RESET}"
     exit 1
@@ -103,8 +113,8 @@ fi
 echo -e "[+] Captured target agent PID: ${BOLD}${AGENT_PID}${RESET}"
 
 # Launch daemon in background with targeted fence
-echo "[+] Starting exec-snoop daemon with --fence-pid $AGENT_PID..."
-$SUDO ./target/release/exec-snoop --fence-pid "$AGENT_PID" > "$DAEMON_LOG" 2>&1 &
+echo "[+] Starting KernelEye daemon ($DAEMON_BIN) with --fence-pid $AGENT_PID..."
+$SUDO "$DAEMON_BIN" --fence-pid "$AGENT_PID" > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 
 # Wait for daemon to attach and confirm map population

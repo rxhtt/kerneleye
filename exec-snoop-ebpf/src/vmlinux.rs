@@ -1,4 +1,9 @@
-#![allow(non_upper_case_globals, non_snake_case, non_camel_case_types, dead_code)]
+#![allow(
+    non_upper_case_globals,
+    non_snake_case,
+    non_camel_case_types,
+    dead_code
+)]
 
 #[repr(C)]
 pub struct task_struct {
@@ -82,5 +87,3 @@ pub struct file {
     pub _pad0: [u8; 64],
     pub f_path: path,
 }
-
-

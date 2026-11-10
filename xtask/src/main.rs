@@ -1,6 +1,6 @@
-use std::process::Command;
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use anyhow::{bail, Context, Result};
+use std::process::Command;
 
 #[derive(Debug, Parser)]
 #[command(name = "xtask")]
@@ -48,7 +48,11 @@ fn main() -> Result<()> {
             if let Ok(entries) = std::fs::read_dir(&build_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.file_name().and_then(|n| n.to_str()).map_or(false, |s| s.starts_with("exec-snoop-")) {
+                    if path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map_or(false, |s| s.starts_with("exec-snoop-"))
+                    {
                         let candidate = path.join("out/exec-snoop");
                         if candidate.exists() {
                             let _ = std::fs::copy(&candidate, &ebpf_dest);
@@ -72,4 +76,3 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
-

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  check:
+    name: Rust & eBPF Check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
+
+      - name: Format Check
+        run: cargo fmt --all -- --check
+
+      - name: Build Userspace Daemon
+        run: cargo check -p exec-snoop -p exec-snoop-common
+
+  python-sdk:
+    name: Python SDK Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install SDK & Run Tests
+        run: |
+          cd bindings/python
+          pip install -e .
+          python tests/test_sdk.py

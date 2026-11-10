@@ -1,13 +1,18 @@
+use aya::Btf;
 use aya::maps::{Array, HashMap, PerCpuArray, RingBuf};
 use aya::programs::{Lsm, TracePoint};
-use aya::Btf;
 use clap::Parser;
-use exec_snoop_common::{ConfinementViolationEvent, ProcessExecEvent, MAX_ARGS_LEN};
+use exec_snoop_common::{ConfinementViolationEvent, MAX_ARGS_LEN, ProcessExecEvent};
 use std::convert::TryInto;
 use std::time::Duration;
 use tokio::signal;
 
 #[derive(Debug, Parser)]
+#[command(
+    name = "kerneleye",
+    about = "Zero-container Linux eBPF LSM process isolation and network egress denial for autonomous AI agents",
+    version = "0.2.0"
+)]
 struct Opt {
     /// Target PID(s) to fence. Any child spawned by these PIDs will be restricted.
     #[arg(long = "fence-pid", value_name = "PID")]
@@ -22,7 +27,10 @@ struct Opt {
     block: String,
 
     /// Comma-separated list of sensitive file basenames to block for fenced agents.
-    #[arg(long = "block-files", default_value = "id_rsa,id_ed25519,credentials,.env,shadow,authorized_keys")]
+    #[arg(
+        long = "block-files",
+        default_value = "id_rsa,id_ed25519,credentials,.env,shadow,authorized_keys"
+    )]
     block_files: String,
 
     /// Run in audit-only mode: log confinement violations to telemetry without blocking operations.
@@ -40,7 +48,9 @@ struct Opt {
 
 fn format_time() -> String {
     let now = std::time::SystemTime::now();
-    let duration = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let duration = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = duration.as_secs() as libc::time_t;
     let mut tm = libc::tm {
         tm_sec: 0,
@@ -129,13 +139,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let lsm_hooks = [
             ("bprm_check_security", "blocking configured binaries"),
             ("socket_connect", "blocking AF_INET/AF_INET6 egress"),
-            ("socket_sendmsg", "blocking connectionless UDP / datagram egress"),
+            (
+                "socket_sendmsg",
+                "blocking connectionless UDP / datagram egress",
+            ),
             ("file_open", "blocking sensitive credential file access"),
-            ("task_kill", "anti-tamper: preventing rogue processes from signaling daemon"),
-            ("ptrace_access_check", "anti-tamper: preventing ptrace of unfenced processes"),
-            ("inode_link", "anti-evasion: blocking hard links to sensitive files"),
-            ("inode_rename", "anti-evasion: blocking renames of sensitive files"),
-            ("inode_unlink", "workspace guard: blocking deletion of critical files"),
+            (
+                "task_kill",
+                "anti-tamper: preventing rogue processes from signaling daemon",
+            ),
+            (
+                "ptrace_access_check",
+                "anti-tamper: preventing ptrace of unfenced processes",
+            ),
+            (
+                "inode_link",
+                "anti-evasion: blocking hard links to sensitive files",
+            ),
+            (
+                "inode_rename",
+                "anti-evasion: blocking renames of sensitive files",
+            ),
+            (
+                "inode_unlink",
+                "workspace guard: blocking deletion of critical files",
+            ),
         ];
 
         for (hook_name, desc) in lsm_hooks {
@@ -227,13 +255,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("[+] Streaming process executions (Press Ctrl+C to stop)...");
 
-    let ring_buf = RingBuf::try_from(
-        bpf.take_map("RINGBUF")
-            .ok_or("RINGBUF map not found")?,
-    )?;
+    let ring_buf = RingBuf::try_from(bpf.take_map("RINGBUF").ok_or("RINGBUF map not found")?)?;
     let mut async_ring_buf = unsafe { tokio::io::unix::AsyncFd::register(ring_buf) }?;
 
-    let violations_buf = bpf.take_map("VIOLATIONS").and_then(|m| RingBuf::try_from(m).ok());
+    let violations_buf = bpf
+        .take_map("VIOLATIONS")
+        .and_then(|m| RingBuf::try_from(m).ok());
     let mut async_violations = match violations_buf {
         Some(rb) => unsafe { tokio::io::unix::AsyncFd::register(rb).ok() },
         None => None,
@@ -252,7 +279,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             let listener = match tokio::net::TcpListener::bind("127.0.0.1:65530").await {
                 Ok(l) => {
-                    println!("[+] Mirage Egress: Phantom Sinkhole active on 127.0.0.1:65530 (Counter-Deception)");
+                    println!(
+                        "[+] Mirage Egress: Phantom Sinkhole active on 127.0.0.1:65530 (Counter-Deception)"
+                    );
                     l
                 }
                 Err(e) => {
@@ -273,8 +302,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 eprintln!(
                                     "[PHANTOM SINKHOLE] Intercepted exfiltration payload from {addr}: {first_line}"
                                 );
-                                if payload.contains("AKIA") || payload.contains("CANARY") || payload.contains("token") {
-                                    eprintln!("[PHANTOM SINKHOLE FORENSICS] Honeypot Canary Token detected in payload!");
+                                if payload.contains("AKIA")
+                                    || payload.contains("CANARY")
+                                    || payload.contains("token")
+                                {
+                                    eprintln!(
+                                        "[PHANTOM SINKHOLE FORENSICS] Honeypot Canary Token detected in payload!"
+                                    );
                                 }
                                 let http_response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}\n";
                                 let _ = socket.write_all(http_response.as_bytes()).await;

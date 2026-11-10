@@ -31,5 +31,5 @@ cargo_metadata = { workspace = true }
 exec-snoop-ebpf = { path = "../exec-snoop-ebpf" }
 
 [[bin]]
-name = "exec-snoop"
+name = "kerneleye"
 path = "src/main.rs"

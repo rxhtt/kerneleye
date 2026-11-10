@@ -8,7 +8,8 @@ import signal
 import subprocess
 import time
 import shutil
-from typing import List, Optional, Union, Dict, Any
+import functools
+from typing import List, Optional, Union, Dict, Any, Callable
 
 
 class KernelFence:
@@ -54,6 +55,8 @@ class KernelFence:
             found = shutil.which("kerneleye") or shutil.which("exec-snoop")
             if not found:
                 for candidate in [
+                    "./target/release/kerneleye",
+                    "../target/release/kerneleye",
                     "./target/release/exec-snoop",
                     "../target/release/exec-snoop",
                     "/usr/local/bin/kerneleye",
@@ -197,3 +200,37 @@ class KernelFence:
                 except Exception:
                     pass
             self._proc = None
+
+
+def fence_agent(
+    block_binaries: Optional[List[str]] = None,
+    protect_files: Optional[List[str]] = None,
+    audit_only: bool = False,
+    cryo_freeze: bool = False,
+    phantom_sink: bool = False,
+    honeypot_canary: bool = False,
+    kill_on_violation: bool = True,
+    daemon_path: Optional[str] = None,
+) -> Callable:
+    """
+    Decorator that attaches in-kernel eBPF LSM confinement to the current process
+    and all descendant child processes during the execution of the decorated function.
+    """
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            fence = KernelFence(
+                pid=os.getpid(),
+                block_binaries=block_binaries,
+                block_files=protect_files,
+                audit_only=audit_only,
+                cryo_freeze=cryo_freeze,
+                phantom_sink=phantom_sink,
+                honeypot_canary=honeypot_canary,
+                kill_on_violation=kill_on_violation,
+                daemon_path=daemon_path,
+            )
+            with fence:
+                return func(*args, **kwargs)
+        return wrapper
+    return decorator

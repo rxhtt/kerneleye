@@ -163,7 +163,7 @@ sudo ./run_demo.sh
 ```bash
 # Clone the repository
 git clone https://github.com/rxhtt/kerneleye.git
-cd kerneleye/exec-snoop
+cd kerneleye
 
 # Compile eBPF kernel probes and userspace daemon
 cargo xtask build --release -j 2
@@ -255,7 +255,7 @@ Configure your `claude_desktop_config.json` to sandbox filesystem tools or execu
 ## CLI Reference
 
 ```text
-Usage: exec-snoop [OPTIONS]
+Usage: kerneleye [OPTIONS]
 
 Options:
       --fence-pid <PID>       Target PID(s) to fence. Any child spawned by these PIDs will be restricted
@@ -271,7 +271,7 @@ Options:
 ### Example: Complete Defense-in-Depth Mode
 ```bash
 # Fence an agent worker, block exfil tools, protect secrets, and enable active deception
-sudo ./target/release/exec-snoop \
+sudo ./target/release/kerneleye \
   --fence-pid 48102 \
   --block "curl,wget,nc,ncat,socat,ssh" \
   --block-files ".env,id_rsa,credentials" \
