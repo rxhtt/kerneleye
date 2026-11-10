@@ -9,27 +9,37 @@ on:
 jobs:
   check:
     name: Rust & eBPF Check
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Rust Toolchain (stable)
+        uses: dtolnay/rust-toolchain@master
         with:
-          components: clippy, rustfmt
+          toolchain: stable
+          components: clippy
+
+      - name: Set up Nightly Rust with rust-src
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src, rustfmt
+
+      - name: Install cargo-binstall
+        uses: taiki-e/install-action@cargo-binstall
 
       - name: Install bpf-linker
-        run: cargo install bpf-linker
+        run: cargo binstall --no-confirm bpf-linker
 
       - name: Format Check
-        run: cargo fmt --all -- --check
+        run: cargo +nightly fmt --all -- --check
 
       - name: Build Userspace Daemon
         run: cargo check -p exec-snoop -p exec-snoop-common
 
   python-sdk:
     name: Python SDK Tests
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
