@@ -1,10 +1,12 @@
-use aya::Btf;
-use aya::maps::{Array, HashMap, PerCpuArray, RingBuf};
-use aya::programs::{Lsm, TracePoint};
+use std::{convert::TryInto, time::Duration};
+
+use aya::{
+    Btf,
+    maps::{Array, HashMap, PerCpuArray, RingBuf},
+    programs::{Lsm, TracePoint},
+};
 use clap::Parser;
 use exec_snoop_common::{ConfinementViolationEvent, MAX_ARGS_LEN, ProcessExecEvent};
-use std::convert::TryInto;
-use std::time::Duration;
 use tokio::signal;
 
 #[derive(Debug, Parser)]

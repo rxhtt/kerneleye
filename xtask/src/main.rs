@@ -1,6 +1,7 @@
+use std::process::Command;
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use std::process::Command;
 
 #[derive(Debug, Parser)]
 #[command(name = "xtask")]
