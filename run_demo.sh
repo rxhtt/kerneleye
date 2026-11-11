@@ -59,10 +59,10 @@ echo "Egress attempt reached the network layer."
 echo ""
 
 # -----------------------------------------------------------------------------
-# TEST 2: Fenced Agent Run
+# TEST 2: Fenced Agent Run via PID Gate
 # -----------------------------------------------------------------------------
 echo -e "${BOLD}------------------------------------------------------------------------------${RESET}"
-echo -e "${BOLD} TEST 2: Fenced Agent Execution (LSM bprm_check_security Enforcement)       ${RESET}"
+echo -e "${BOLD} TEST 2: Fenced Agent Execution via Manual PID Registration                  ${RESET}"
 echo -e "${BOLD}------------------------------------------------------------------------------${RESET}"
 echo "Registering agent session in PROTECTED_AGENT_PIDS map..."
 echo ""
@@ -152,8 +152,19 @@ else
     cat "$DAEMON_LOG" 2>/dev/null || true
 fi
 
+# -----------------------------------------------------------------------------
+# TEST 3: Zero-Race Direct Runner (kerneleye run -- <CMD>)
+# -----------------------------------------------------------------------------
+echo ""
+echo -e "${BOLD}------------------------------------------------------------------------------${RESET}"
+echo -e "${BOLD} TEST 3: Zero-Race Direct Runner (kerneleye run -- python3 $SCRIPT_PATH)      ${RESET}"
+echo -e "${BOLD}------------------------------------------------------------------------------${RESET}"
+echo "Spawning agent directly through KernelEye zero-race handshake with scorecard & audit..."
+echo ""
+
+$SUDO "$DAEMON_BIN" --scrub-env --audit-log "/tmp/kerneleye_demo_audit.jsonl" run -- python3 "$SCRIPT_PATH" || true
+
 echo ""
 echo -e "${BOLD}==============================================================================${RESET}"
 echo -e "${BOLD}   VERIFICATION COMPLETE: Zero False Positives | Strict Agent Confinement      ${RESET}"
 echo -e "${BOLD}==============================================================================${RESET}"
-

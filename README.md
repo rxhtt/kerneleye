@@ -147,19 +147,24 @@ To maintain strict technical accuracy, the following architectural boundaries mu
 * `bpf-linker` (`cargo install bpf-linker`)
 * Root access (`sudo`) to attach LSM hooks
 
-### Option A: Install Pre-Built Binary (Recommended)
+### Option A: Direct Runner (Zero-Race Confinement - Recommended)
 
 ```bash
-# Download and extract the latest release
-curl -sSLO https://github.com/rxhtt/kerneleye/releases/download/v0.1.0/kerneleye-v0.1.0-x86_64-linux.tar.gz
-tar -xzf kerneleye-v0.1.0-x86_64-linux.tar.gz
-cd kerneleye-v0.1.0-x86_64-linux
+# Execute any agent command directly inside zero-race kernel confinement
+sudo kerneleye run -- pytest tests/
 
-# Run the self-contained verification demo
-sudo ./run_demo.sh
+# With sensitive environment variable scrubbing & flight recorder audit trail
+sudo kerneleye --scrub-env --audit-log flight_audit.jsonl run -- python3 agent.py
 ```
 
-### Option B: Build from Source
+### Option B: Dynamic Attach to Running Agent
+
+```bash
+# Adopt an existing running agent process tree into kernel confinement
+sudo kerneleye attach 48102
+```
+
+### Option C: Build from Source
 ```bash
 # Clone the repository
 git clone https://github.com/rxhtt/kerneleye.git
@@ -252,31 +257,87 @@ Configure your `claude_desktop_config.json` to sandbox filesystem tools or execu
 
 ---
 
+## CI/CD GitHub Action
+
+Drop KernelEye into your benchmark eval or CI pipeline to ensure agent tasks never exfiltrate credentials or tamper with host environments:
+
+```yaml
+- name: Run Agent Benchmark under KernelEye Confinement
+  uses: rxhtt/kerneleye@main
+  with:
+    command: "pytest tests/swe_bench/"
+    block-binaries: "curl,wget,nc,ncat,socat"
+    block-files: "id_rsa,.env,credentials"
+    scrub-env: "true"
+    audit-log: "kerneleye-audit.jsonl"
+```
+
+---
+
+## Session Security Scorecard
+
+Upon session completion (or process termination), KernelEye renders an immutable ASCII audit scorecard with exact metrics:
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│                       KERNELEYE SECURITY SCORECARD                     │
+├────────────────────────────────────────────────────────────────────────┤
+│ Elapsed Session Time        : 4.28s                                    │
+│ Total Execs Intercepted     : 42                                       │
+│ Unique Processes Tracked    : 7                                        │
+│ Total Confinement Violations : 3                                       │
+│ Blocked Binary Executions   : 2 [curl: 2]                              │
+│ Blocked File Accesses       : 1 [.env: 1]                              │
+│ Blocked Network Drops       : 0                                        │
+│ Child Process Exit Status   : 0                                        │
+│ Security Posture            : CONFINEMENT PRESERVED (VIOLATIONS BLOCKED)│
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## CLI Reference
 
 ```text
-Usage: kerneleye [OPTIONS]
+Usage: kerneleye [OPTIONS] [COMMAND]
+
+Commands:
+  run     Execute a command directly inside zero-race kernel confinement: kerneleye run -- <CMD> [ARGS...]
+  attach  Attach live to an existing running process tree and dynamically adopt it into the kernel fence
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
-      --fence-pid <PID>       Target PID(s) to fence. Any child spawned by these PIDs will be restricted
-      --block <BLOCK>         Comma-separated list of unauthorized binary basenames [default: curl,wget,nc,ncat,socat]
-      --block-files <FILES>   Comma-separated list of sensitive file basenames to block [default: id_rsa,id_ed25519,credentials,.env,shadow,authorized_keys]
-      --audit-only            Run in audit mode: log violations to telemetry without blocking operations
-      --cryo-freeze           Suspend offending process tree in RAM (SIGSTOP) instead of terminating it
-      --phantom-sink          Launch active counter-deception Phantom Sinkhole on 127.0.0.1:65530
-      --kill-on-violation     Terminate the fenced root agent session immediately upon confinement violation
-  -h, --help                  Print help
+      --fence-pid <PID>            Target PID(s) to fence. Any child spawned by these PIDs will be restricted
+      --kill-on-violation          Terminate the fenced root agent session immediately upon confinement violation
+      --block <BLOCK>              Comma-separated list of unauthorized binary basenames [default: curl,wget,nc,ncat,socat]
+      --block-files <BLOCK_FILES>  Comma-separated list of sensitive file basenames to block [default: id_rsa,id_ed25519,credentials,.env,shadow,authorized_keys]
+      --audit-only                 Run in audit mode: log violations to telemetry without blocking operations
+      --cryo-freeze                Freeze offending process tree in RAM (SIGSTOP) instead of terminating it
+      --phantom-sink               Launch active counter-deception Phantom Sinkhole on 127.0.0.1:65530
+      --audit-log <PATH>           Path to flight recorder immutable JSONL audit log
+      --scrub-env                  Sanitize high-risk credentials (AWS_*, OPENAI_*, GITHUB_*) from child environment
+      --allow-env <ALLOW_ENV>      Comma-separated list of environment variables to preserve [default: PATH,HOME,USER,SHELL,TERM,LANG]
+  -q, --quiet                      Suppress verbose process execution trace in runner mode
+  -h, --help                       Print help
+  -V, --version                    Print version
 ```
 
-### Example: Complete Defense-in-Depth Mode
+### Examples
+
 ```bash
-# Fence an agent worker, block exfil tools, protect secrets, and enable active deception
-sudo ./target/release/kerneleye \
-  --fence-pid 48102 \
+# 1. Direct Runner with secret scrubbing and flight recorder
+sudo kerneleye --scrub-env --audit-log audit.jsonl run -- python3 agent.py
+
+# 2. Dynamic Attach to an existing background daemon or agent
+sudo kerneleye attach 48102
+
+# 3. Complete Defense-in-Depth with Cryo-Freeze and Phantom Sinkhole
+sudo kerneleye \
   --block "curl,wget,nc,ncat,socat,ssh" \
   --block-files ".env,id_rsa,credentials" \
   --cryo-freeze \
-  --phantom-sink
+  --phantom-sink \
+  run -- npm test
 ```
 
 ---

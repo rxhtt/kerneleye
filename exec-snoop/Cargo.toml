@@ -23,6 +23,7 @@ tokio = { workspace = true, features = [
     "signal",
     "time",
     "io-util",
+    "sync",
 ] }
 [build-dependencies]
 anyhow = { workspace = true }

@@ -1,0 +1,68 @@
+name: "KernelEye eBPF Agent Confinement"
+description: "Zero-container Linux eBPF LSM security fence for autonomous AI coding agents and benchmark runs"
+author: "KernelEye Team"
+inputs:
+  command:
+    description: "Command to execute under zero-race kernel confinement"
+    required: true
+  block-binaries:
+    description: "Comma-separated list of unauthorized binary names to block"
+    required: false
+    default: "curl,wget,nc,ncat,socat"
+  block-files:
+    description: "Comma-separated list of sensitive credential files to protect"
+    required: false
+    default: "id_rsa,id_ed25519,credentials,.env,shadow,authorized_keys"
+  audit-log:
+    description: "Path to write immutable JSONL flight recorder audit log"
+    required: false
+    default: "kerneleye-audit.jsonl"
+  scrub-env:
+    description: "Sanitize high-risk credentials (AWS_*, OPENAI_*, GITHUB_*) from environment"
+    required: false
+    default: "true"
+  kill-on-violation:
+    description: "Terminate process immediately on policy violation"
+    required: false
+    default: "false"
+  cryo-freeze:
+    description: "Suspend offending process tree in RAM (SIGSTOP) instead of terminating"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Run under KernelEye Confinement
+      shell: bash
+      run: |
+        ARGS=()
+        if [ -n "${{ inputs.block-binaries }}" ]; then
+          ARGS+=("--block" "${{ inputs.block-binaries }}")
+        fi
+        if [ -n "${{ inputs.block-files }}" ]; then
+          ARGS+=("--block-files" "${{ inputs.block-files }}")
+        fi
+        if [ "${{ inputs.scrub-env }}" = "true" ]; then
+          ARGS+=("--scrub-env")
+        fi
+        if [ "${{ inputs.kill-on-violation }}" = "true" ]; then
+          ARGS+=("--kill-on-violation")
+        fi
+        if [ "${{ inputs.cryo-freeze }}" = "true" ]; then
+          ARGS+=("--cryo-freeze")
+        fi
+        if [ -n "${{ inputs.audit-log }}" ]; then
+          ARGS+=("--audit-log" "${{ inputs.audit-log }}")
+        fi
+
+        KERNELEYE_BIN="${{ github.action_path }}/target/release/kerneleye"
+        if [ ! -f "$KERNELEYE_BIN" ]; then
+          KERNELEYE_BIN=$(which kerneleye 2>/dev/null || echo "kerneleye")
+        fi
+
+        echo "::group::KernelEye eBPF Confinement Session"
+        sudo "$KERNELEYE_BIN" "${ARGS[@]}" run -- ${{ inputs.command }}
+        EXIT_CODE=$?
+        echo "::endgroup::"
+        exit $EXIT_CODE

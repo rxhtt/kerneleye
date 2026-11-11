@@ -28,6 +28,9 @@ class KernelFence:
         phantom_sink: bool = False,
         honeypot_canary: bool = False,
         kill_on_violation: bool = True,
+        scrub_env: bool = False,
+        allow_env: Optional[List[str]] = None,
+        audit_log: Optional[str] = None,
         daemon_path: Optional[str] = None,
     ):
         self.target_pid = pid
@@ -45,6 +48,9 @@ class KernelFence:
         self.phantom_sink = phantom_sink
         self.honeypot_canary = honeypot_canary
         self.kill_on_violation = kill_on_violation
+        self.scrub_env = scrub_env
+        self.allow_env = allow_env
+        self.audit_log = audit_log
         self._spawned_pgids: List[int] = []
         self._canary_paths: List[str] = []
 
@@ -57,6 +63,7 @@ class KernelFence:
                 for candidate in [
                     "./target/release/kerneleye",
                     "../target/release/kerneleye",
+                    "../../target/release/kerneleye",
                     "./target/release/exec-snoop",
                     "../target/release/exec-snoop",
                     "/usr/local/bin/kerneleye",
@@ -105,6 +112,12 @@ class KernelFence:
 
         if self.phantom_sink:
             cmd.append("--phantom-sink")
+        if self.scrub_env:
+            cmd.append("--scrub-env")
+        if self.allow_env:
+            cmd.extend(["--allow-env", ",".join(self.allow_env)])
+        if self.audit_log:
+            cmd.extend(["--audit-log", self.audit_log])
 
         self._proc = subprocess.Popen(
             cmd,
@@ -114,6 +127,45 @@ class KernelFence:
             preexec_fn=os.setpgrp,
         )
         time.sleep(0.35)
+
+    def run_direct(
+        self,
+        command: List[str],
+        timeout: Optional[float] = None,
+    ) -> subprocess.CompletedProcess:
+        """
+        Executes command directly using `kerneleye run -- <CMD>` (zero-race in-kernel confinement).
+        """
+        cmd = ["sudo", self.daemon_path]
+        if self.block_binaries:
+            cmd.extend(["--block", ",".join(self.block_binaries)])
+        if self.block_files:
+            cmd.extend(["--block-files", ",".join(self.block_files)])
+        if self.audit_only:
+            cmd.append("--audit-only")
+        elif self.cryo_freeze:
+            cmd.append("--cryo-freeze")
+        elif self.kill_on_violation:
+            cmd.append("--kill-on-violation")
+        if self.phantom_sink:
+            cmd.append("--phantom-sink")
+        if self.scrub_env:
+            cmd.append("--scrub-env")
+        if self.allow_env:
+            cmd.extend(["--allow-env", ",".join(self.allow_env)])
+        if self.audit_log:
+            cmd.extend(["--audit-log", self.audit_log])
+        cmd.append("run")
+        cmd.append("--")
+        cmd.extend(command)
+
+        return subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
 
     def run_command(
         self,
@@ -126,7 +178,6 @@ class KernelFence:
         Executes a command inside an isolated process group fenced by eBPF LSM.
         Guarantees that on exit, any lingering background forks are wiped with SIGKILL.
         """
-        # Create a worker pipe to capture worker PID before execution
         if isinstance(command, str):
             shell_cmd = f"echo $$ > /tmp/_kf_pid_{os.getpid()}; exec {command}"
             worker_proc = subprocess.Popen(
@@ -153,7 +204,7 @@ class KernelFence:
         self._spawned_pgids.append(pgid)
 
         # Attach fence if not already attached to this worker
-        if self._proc is None:
+        if self._proc is None and self.target_pid is None:
             self._start_daemon(worker_proc.pid)
 
         try:
@@ -210,6 +261,9 @@ def fence_agent(
     phantom_sink: bool = False,
     honeypot_canary: bool = False,
     kill_on_violation: bool = True,
+    scrub_env: bool = False,
+    allow_env: Optional[List[str]] = None,
+    audit_log: Optional[str] = None,
     daemon_path: Optional[str] = None,
 ) -> Callable:
     """
@@ -228,6 +282,9 @@ def fence_agent(
                 phantom_sink=phantom_sink,
                 honeypot_canary=honeypot_canary,
                 kill_on_violation=kill_on_violation,
+                scrub_env=scrub_env,
+                allow_env=allow_env,
+                audit_log=audit_log,
                 daemon_path=daemon_path,
             )
             with fence:
