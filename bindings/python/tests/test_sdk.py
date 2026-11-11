@@ -31,7 +31,7 @@ def test_kernel_fence_init():
 
 
 def test_kernel_fence_custom_policies():
-    """Verify custom security policies and scrub options."""
+    """Verify custom security policies, proxy options, and scrub options."""
     fence = KernelFence(
         pid=1337,
         block_binaries=["custom_bin", "bash"],
@@ -41,6 +41,11 @@ def test_kernel_fence_custom_policies():
         scrub_env=True,
         allow_env=["PATH", "LANG"],
         audit_log="audit.jsonl",
+        workspace="/tmp/test_workspace",
+        proxy_allow_registries=True,
+        proxy_port=18080,
+        allow_domains=["registry.yarnpkg.com"],
+        allow_ips=["10.0.0.1"],
     )
     assert fence.target_pid == 1337
     assert fence.block_binaries == ["custom_bin", "bash"]
@@ -50,6 +55,11 @@ def test_kernel_fence_custom_policies():
     assert fence.scrub_env is True
     assert fence.allow_env == ["PATH", "LANG"]
     assert fence.audit_log == "audit.jsonl"
+    assert fence.workspace == "/tmp/test_workspace"
+    assert fence.proxy_allow_registries is True
+    assert fence.proxy_port == 18080
+    assert fence.allow_domains == ["registry.yarnpkg.com"]
+    assert fence.allow_ips == ["10.0.0.1"]
 
 
 def test_fence_agent_decorator():

@@ -27,10 +27,16 @@ class KernelFence:
         cryo_freeze: bool = False,
         phantom_sink: bool = False,
         honeypot_canary: bool = False,
+        canary_tokens: bool = False,
         kill_on_violation: bool = True,
         scrub_env: bool = False,
         allow_env: Optional[List[str]] = None,
         audit_log: Optional[str] = None,
+        workspace: Optional[str] = None,
+        proxy_allow_registries: bool = False,
+        proxy_port: int = 18080,
+        allow_domains: Optional[List[str]] = None,
+        allow_ips: Optional[List[str]] = None,
         daemon_path: Optional[str] = None,
     ):
         self.target_pid = pid
@@ -46,11 +52,17 @@ class KernelFence:
         self.audit_only = audit_only
         self.cryo_freeze = cryo_freeze
         self.phantom_sink = phantom_sink
-        self.honeypot_canary = honeypot_canary
+        self.honeypot_canary = honeypot_canary or canary_tokens
+        self.canary_tokens = self.honeypot_canary
         self.kill_on_violation = kill_on_violation
         self.scrub_env = scrub_env
         self.allow_env = allow_env
         self.audit_log = audit_log
+        self.workspace = workspace
+        self.proxy_allow_registries = proxy_allow_registries
+        self.proxy_port = proxy_port
+        self.allow_domains = allow_domains
+        self.allow_ips = allow_ips
         self._spawned_pgids: List[int] = []
         self._canary_paths: List[str] = []
 
@@ -77,7 +89,7 @@ class KernelFence:
 
     def __enter__(self):
         if self.honeypot_canary:
-            canary_path = os.path.join(os.getcwd(), ".env.canary")
+            canary_path = os.path.join(self.workspace or os.getcwd(), ".env.canary")
             try:
                 with open(canary_path, "w") as f:
                     f.write("# KernelEye Honeypot Canary Credential (Mirage VFS)\n")
@@ -118,6 +130,17 @@ class KernelFence:
             cmd.extend(["--allow-env", ",".join(self.allow_env)])
         if self.audit_log:
             cmd.extend(["--audit-log", self.audit_log])
+        if self.workspace:
+            cmd.extend(["--workspace", self.workspace])
+        if self.proxy_allow_registries:
+            cmd.append("--proxy-allow-registries")
+            cmd.extend(["--proxy-port", str(self.proxy_port)])
+        if self.allow_domains:
+            cmd.extend(["--allow-domain", ",".join(self.allow_domains)])
+        if self.allow_ips:
+            cmd.extend(["--allow-ip", ",".join(self.allow_ips)])
+        if self.canary_tokens:
+            cmd.append("--canary-tokens")
 
         self._proc = subprocess.Popen(
             cmd,
@@ -155,6 +178,18 @@ class KernelFence:
             cmd.extend(["--allow-env", ",".join(self.allow_env)])
         if self.audit_log:
             cmd.extend(["--audit-log", self.audit_log])
+        if self.workspace:
+            cmd.extend(["--workspace", self.workspace])
+        if self.proxy_allow_registries:
+            cmd.append("--proxy-allow-registries")
+            cmd.extend(["--proxy-port", str(self.proxy_port)])
+        if self.allow_domains:
+            cmd.extend(["--allow-domain", ",".join(self.allow_domains)])
+        if self.allow_ips:
+            cmd.extend(["--allow-ip", ",".join(self.allow_ips)])
+        if self.canary_tokens:
+            cmd.append("--canary-tokens")
+
         cmd.append("run")
         cmd.append("--")
         cmd.extend(command)
@@ -178,6 +213,7 @@ class KernelFence:
         Executes a command inside an isolated process group fenced by eBPF LSM.
         Guarantees that on exit, any lingering background forks are wiped with SIGKILL.
         """
+        eff_cwd = cwd or self.workspace
         if isinstance(command, str):
             shell_cmd = f"echo $$ > /tmp/_kf_pid_{os.getpid()}; exec {command}"
             worker_proc = subprocess.Popen(
@@ -185,7 +221,7 @@ class KernelFence:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                cwd=cwd,
+                cwd=eff_cwd,
                 env=env,
                 preexec_fn=os.setpgrp,
             )
@@ -195,7 +231,7 @@ class KernelFence:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                cwd=cwd,
+                cwd=eff_cwd,
                 env=env,
                 preexec_fn=os.setpgrp,
             )
@@ -260,10 +296,13 @@ def fence_agent(
     cryo_freeze: bool = False,
     phantom_sink: bool = False,
     honeypot_canary: bool = False,
+    canary_tokens: bool = False,
     kill_on_violation: bool = True,
     scrub_env: bool = False,
     allow_env: Optional[List[str]] = None,
     audit_log: Optional[str] = None,
+    workspace: Optional[str] = None,
+    proxy_allow_registries: bool = False,
     daemon_path: Optional[str] = None,
 ) -> Callable:
     """
@@ -280,11 +319,13 @@ def fence_agent(
                 audit_only=audit_only,
                 cryo_freeze=cryo_freeze,
                 phantom_sink=phantom_sink,
-                honeypot_canary=honeypot_canary,
+                honeypot_canary=honeypot_canary or canary_tokens,
                 kill_on_violation=kill_on_violation,
                 scrub_env=scrub_env,
                 allow_env=allow_env,
                 audit_log=audit_log,
+                workspace=workspace,
+                proxy_allow_registries=proxy_allow_registries,
                 daemon_path=daemon_path,
             )
             with fence:

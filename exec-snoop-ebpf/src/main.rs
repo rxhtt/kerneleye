@@ -13,7 +13,9 @@ use exec_snoop_common::{
 };
 
 mod vmlinux;
-use vmlinux::{dentry, file, linux_binprm, msghdr, sockaddr, socket, task_struct};
+use vmlinux::{
+    dentry, file, linux_binprm, msghdr, sockaddr, sockaddr_in, sockaddr_in6, socket, task_struct,
+};
 
 macro_rules! bpf_core_read {
     ($target:expr) => {
@@ -44,6 +46,21 @@ static AUDIT_MODE: Array<u8> = Array::with_max_entries(1, 0);
 
 #[map]
 static DAEMON_PID: Array<u32> = Array::with_max_entries(1, 0);
+
+#[map]
+static ALLOW_LOOPBACK: Array<u8> = Array::with_max_entries(1, 0);
+
+#[map]
+static ALLOWED_IPS: HashMap<u32, u8> = HashMap::with_max_entries(256, 0);
+
+#[inline(always)]
+fn is_loopback_allowed() -> bool {
+    if let Some(val) = ALLOW_LOOPBACK.get(0) {
+        *val != 0
+    } else {
+        false
+    }
+}
 
 #[inline(always)]
 fn is_audit_mode() -> bool {
@@ -354,8 +371,44 @@ pub fn socket_connect(ctx: LsmContext) -> i32 {
     let addr: *const sockaddr = ctx.arg(1);
     if !addr.is_null() {
         if let Ok(family) = unsafe { bpf_core_read!((*addr).sa_family) } {
-            // AF_INET = 2, AF_INET6 = 10
-            if family == 2 || family == 10 {
+            // AF_INET = 2
+            if family == 2 {
+                let sin = addr as *const sockaddr_in;
+                if let Ok(ip_bytes) = unsafe { bpf_core_read!((*sin).sin_addr) } {
+                    // Check IPv4 loopback (127.0.0.0/8)
+                    if ip_bytes[0] == 127 && is_loopback_allowed() {
+                        return 0;
+                    }
+                    let ip_u32 = u32::from_ne_bytes(ip_bytes);
+                    if unsafe { ALLOWED_IPS.get(&ip_u32).is_some() } {
+                        return 0;
+                    }
+                }
+                let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
+                emit_violation(
+                    fenced_root_pid,
+                    current_pid,
+                    comm,
+                    b"network:socket_connect\0",
+                );
+                if is_audit_mode() {
+                    return 0;
+                }
+                return -1; // -EPERM
+            }
+
+            // AF_INET6 = 10
+            if family == 10 {
+                let sin6 = addr as *const sockaddr_in6;
+                if let Ok(ip6_bytes) = unsafe { bpf_core_read!((*sin6).sin6_addr) } {
+                    let is_v6_loopback = ip6_bytes[15] == 1
+                        && ip6_bytes[0] == 0
+                        && ip6_bytes[1] == 0
+                        && ip6_bytes[2] == 0;
+                    if is_v6_loopback && is_loopback_allowed() {
+                        return 0;
+                    }
+                }
                 let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
                 emit_violation(
                     fenced_root_pid,
@@ -400,7 +453,37 @@ pub fn socket_sendmsg(ctx: LsmContext) -> i32 {
             if !name_ptr.is_null() {
                 let addr = name_ptr as *const sockaddr;
                 if let Ok(family) = unsafe { bpf_core_read!((*addr).sa_family) } {
-                    if family == 2 || family == 10 {
+                    if family == 2 {
+                        let sin = addr as *const sockaddr_in;
+                        if let Ok(ip_bytes) = unsafe { bpf_core_read!((*sin).sin_addr) } {
+                            if ip_bytes[0] == 127 && is_loopback_allowed() {
+                                return 0;
+                            }
+                            let ip_u32 = u32::from_ne_bytes(ip_bytes);
+                            if unsafe { ALLOWED_IPS.get(&ip_u32).is_some() } {
+                                return 0;
+                            }
+                        }
+                        let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
+                        emit_violation(
+                            fenced_root_pid,
+                            current_pid,
+                            comm,
+                            b"network:socket_sendmsg\0",
+                        );
+                        if is_audit_mode() {
+                            return 0;
+                        }
+                        return -1; // -EPERM
+                    }
+                    if family == 10 {
+                        let sin6 = addr as *const sockaddr_in6;
+                        if let Ok(ip6_bytes) = unsafe { bpf_core_read!((*sin6).sin6_addr) } {
+                            let is_v6_loopback = ip6_bytes[15] == 1 && ip6_bytes[0] == 0;
+                            if is_v6_loopback && is_loopback_allowed() {
+                                return 0;
+                            }
+                        }
                         let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
                         emit_violation(
                             fenced_root_pid,

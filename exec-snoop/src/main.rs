@@ -1,9 +1,10 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     convert::TryInto,
     fs::OpenOptions,
     io::Write,
-    sync::Mutex,
+    net::Ipv4Addr,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -57,6 +58,38 @@ struct Opt {
     #[arg(long = "phantom-sink")]
     phantom_sink: bool,
 
+    /// Transparent local audit proxy on 127.0.0.1:18080: permits package registries (npm, cargo, pypi, git) & blocks exfiltration.
+    #[arg(long = "proxy-allow-registries")]
+    proxy_allow_registries: bool,
+
+    /// Port for the transparent registry proxy [default: 18080].
+    #[arg(long = "proxy-port", default_value = "18080")]
+    proxy_port: u16,
+
+    /// Comma-separated list of extra trusted domains to permit through the registry proxy.
+    #[arg(long = "allow-domain", default_value = "")]
+    allow_domain: String,
+
+    /// Comma-separated list of IPv4 addresses to whitelist for in-kernel network egress.
+    #[arg(long = "allow-ip", default_value = "")]
+    allow_ip: String,
+
+    /// In-kernel allow loopback network traffic (127.0.0.0/8 and ::1).
+    #[arg(long = "allow-loopback")]
+    allow_loopback: bool,
+
+    /// Strict workspace boundary directory sandboxing. Restricts execution and file modifications to DIR.
+    #[arg(long = "workspace", value_name = "DIR")]
+    workspace: Option<String>,
+
+    /// Deploy honeypot canary credential tokens (.env.canary, credentials.canary) with automated tripwires.
+    #[arg(long = "canary-tokens")]
+    canary_tokens: bool,
+
+    /// Launch real-time interactive terminal monitoring dashboard.
+    #[arg(long = "tui")]
+    tui: bool,
+
     /// Path to flight recorder immutable JSONL audit log.
     #[arg(long = "audit-log", value_name = "PATH")]
     audit_log: Option<String>,
@@ -73,7 +106,7 @@ struct Opt {
     #[arg(short = 'q', long = "quiet")]
     quiet: bool,
 
-    /// Trailing command to execute directly under kernel confinement: kerneleye [OPTIONS] -- <CMD> [ARGS...]
+    /// Direct execution shorthand: command and arguments to execute after '--'.
     #[arg(last = true)]
     trailing_cmd: Vec<String>,
 }
@@ -91,6 +124,8 @@ enum Commands {
         /// Process ID (PID) of the target agent or worker process.
         pid: u32,
     },
+    /// Launch real-time interactive terminal monitoring dashboard: kerneleye top
+    Top,
 }
 
 struct FlightRecorder {
@@ -241,6 +276,47 @@ fn find_process_tree(target_pid: u32) -> HashSet<u32> {
     tree
 }
 
+struct CanaryGuard {
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl CanaryGuard {
+    fn create(workspace_dir: Option<&str>) -> Self {
+        let base_dir = workspace_dir
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
+
+        let mut paths = Vec::new();
+
+        let env_canary = base_dir.join(".env.canary");
+        let content = "# KernelEye Honeypot Canary Credential (Mirage VFS)\nAWS_ACCESS_KEY_ID=AKIA_CANARY_TRUMAN_SHOW_99812_PROD_FAKE\nAWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY_CANARY\nOPENAI_API_KEY=sk-proj-canary-honeypot-token-do-not-leak-99881\nEXFIL_SINK_URL=http://127.0.0.1:65530/canary_exfil\n";
+        if std::fs::write(&env_canary, content).is_ok() {
+            paths.push(env_canary);
+        }
+
+        let cred_canary = base_dir.join("credentials.canary");
+        let cred_content = "[default]\naws_access_key_id = AKIA_CANARY_TRUMAN_SHOW_99812_PROD_FAKE\naws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY_CANARY\n";
+        if std::fs::write(&cred_canary, cred_content).is_ok() {
+            paths.push(cred_canary);
+        }
+
+        println!(
+            "[+] Canary Honeypot active: Injected honeypot credentials (.env.canary, credentials.canary)"
+        );
+        Self { paths }
+    }
+}
+
+impl Drop for CanaryGuard {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 struct SessionStats {
     start_time: Instant,
     total_execs: u64,
@@ -263,6 +339,13 @@ fn truncate_pad(s: &str, width: usize) -> String {
     } else {
         format!("{:<width$}", s, width = width)
     }
+}
+
+fn format_uptime(secs: u64) -> String {
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{hours:02}:{mins:02}:{s:02}")
 }
 
 fn print_scorecard(stats: &SessionStats, exit_code: Option<i32>) {
@@ -383,9 +466,139 @@ fn format_time() -> String {
     }
 }
 
+async fn run_registry_proxy(
+    port: u16,
+    extra_domains: Vec<String>,
+    recorder: Arc<FlightRecorder>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await?;
+    println!(
+        "[+] Transparent Registry Proxy active on 127.0.0.1:{port} (Whitelist Filter Enabled)"
+    );
+
+    let mut allowed_domains: HashSet<String> = [
+        "registry.npmjs.org",
+        "crates.io",
+        "static.crates.io",
+        "index.crates.io",
+        "pypi.org",
+        "files.pythonhosted.org",
+        "pypi.python.org",
+        "github.com",
+        "raw.githubusercontent.com",
+        "objects.githubusercontent.com",
+        "api.github.com",
+        "archive.ubuntu.com",
+        "security.ubuntu.com",
+        "dl-cdn.alpinelinux.org",
+        "repo.anaconda.com",
+        "conda.anaconda.org",
+        "rubygems.org",
+        "golang.org",
+        "proxy.golang.org",
+        "sum.golang.org",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    for d in extra_domains {
+        allowed_domains.insert(d.to_lowercase());
+    }
+
+    loop {
+        if let Ok((mut client_sock, client_addr)) = listener.accept().await {
+            let domains = allowed_domains.clone();
+            let rec = recorder.clone();
+
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = match client_sock.read(&mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => return,
+                };
+
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req.lines().next().unwrap_or("");
+
+                if first_line.starts_with("CONNECT ") {
+                    let parts: Vec<&str> = first_line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let target = parts[1];
+                        let host = target.split(':').next().unwrap_or(target).to_lowercase();
+
+                        let is_allowed = domains
+                            .iter()
+                            .any(|d| host == *d || host.ends_with(&format!(".{d}")));
+
+                        if is_allowed {
+                            if let Ok(mut server_sock) = TcpStream::connect(target).await {
+                                let _ = client_sock
+                                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                                    .await;
+                                let _ = tokio::io::copy_bidirectional(
+                                    &mut client_sock,
+                                    &mut server_sock,
+                                )
+                                .await;
+                                return;
+                            }
+                        } else {
+                            eprintln!(
+                                "[REGISTRY SHIELD] Blocked exfiltration attempt from {client_addr} to unauthorized host: {host}"
+                            );
+                            let log = format!(
+                                "{{\"event\":\"proxy_violation\",\"client\":\"{}\",\"target_host\":\"{}\",\"action\":\"forbidden\"}}",
+                                client_addr,
+                                escape_json(&host)
+                            );
+                            rec.log(&log);
+
+                            let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n[BLOCKED BY KERNELEYE REGISTRY SHIELD] Exfiltration attempt to unauthorized host.\n";
+                            let _ = client_sock.write_all(resp).await;
+                            return;
+                        }
+                    }
+                }
+
+                let host_header = req
+                    .lines()
+                    .find(|l| l.to_lowercase().starts_with("host:"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .map(|h| h.trim().to_lowercase())
+                    .unwrap_or_default();
+
+                let is_allowed = domains
+                    .iter()
+                    .any(|d| host_header == *d || host_header.ends_with(&format!(".{d}")));
+
+                if is_allowed && !host_header.is_empty() {
+                    let target = format!("{host_header}:80");
+                    if let Ok(mut server_sock) = TcpStream::connect(&target).await {
+                        let _ = server_sock.write_all(&buf[..n]).await;
+                        let _ =
+                            tokio::io::copy_bidirectional(&mut client_sock, &mut server_sock).await;
+                        return;
+                    }
+                }
+
+                let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n[BLOCKED BY KERNELEYE REGISTRY SHIELD] HTTP request to unauthorized host.\n";
+                let _ = client_sock.write_all(resp).await;
+            });
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::parse();
+
+    let is_tui = opt.tui || matches!(opt.subcmd, Some(Commands::Top));
 
     // Bump RLIMIT_MEMLOCK so kernel allows allocating eBPF maps
     let rlim = libc::rlimit {
@@ -410,7 +623,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     program.load()?;
     program.attach("sched", "sched_process_exec")?;
 
-    println!("[+] eBPF program loaded and attached to sched:sched_process_exec");
+    if !is_tui {
+        println!("[+] eBPF program loaded and attached to sched:sched_process_exec");
+    }
 
     if let Some(fork_prog) = bpf.program_mut("process_fork") {
         let fork_program: Result<&mut TracePoint, _> = fork_prog.try_into();
@@ -420,7 +635,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("[!] Failed to load process_fork: {e}");
                 } else if let Err(e) = p.attach("sched", "sched_process_fork") {
                     eprintln!("[!] Failed to attach sched:sched_process_fork: {e}");
-                } else {
+                } else if !is_tui {
                     println!("[+] eBPF fork tracker attached to sched:sched_process_fork");
                 }
             }
@@ -473,7 +688,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match lsm_program {
                     Ok(lsm_prog) => match lsm_prog.load(hook_name, btf) {
                         Ok(()) => match lsm_prog.attach() {
-                            Ok(_) => println!("[+] eBPF LSM hook attached: {hook_name} ({desc})"),
+                            Ok(_) => {
+                                if !is_tui {
+                                    println!("[+] eBPF LSM hook attached: {hook_name} ({desc})");
+                                }
+                            }
                             Err(e) => eprintln!("[!] Failed to attach LSM hook {hook_name}: {e}"),
                         },
                         Err(e) => eprintln!("[!] Failed to load LSM program {hook_name}: {e}"),
@@ -488,7 +707,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(mut audit_map) = Array::<_, u8>::try_from(map) {
             let val: u8 = if opt.audit_only { 1 } else { 0 };
             let _ = audit_map.set(0, val, 0);
-            if opt.audit_only {
+            if opt.audit_only && !is_tui {
                 println!("[*] AUDIT MODE ACTIVE: Violations will be logged without blocking.");
             }
         }
@@ -498,7 +717,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(mut daemon_map) = Array::<_, u32>::try_from(map) {
             let my_pid = std::process::id();
             let _ = daemon_map.set(0, my_pid, 0);
-            println!("[+] Anti-tamper active: Protected daemon PID {my_pid} against signals");
+            if !is_tui {
+                println!("[+] Anti-tamper active: Protected daemon PID {my_pid} against signals");
+            }
+        }
+    }
+
+    let allow_loopback_active =
+        opt.proxy_allow_registries || opt.phantom_sink || opt.allow_loopback;
+    if let Some(map) = bpf.map_mut("ALLOW_LOOPBACK") {
+        if let Ok(mut loopback_map) = Array::<_, u8>::try_from(map) {
+            let val: u8 = if allow_loopback_active { 1 } else { 0 };
+            let _ = loopback_map.set(0, val, 0);
+            if val == 1 && !is_tui {
+                println!(
+                    "[+] In-kernel loopback permitted for 127.0.0.0/8 (Registry Proxy / Sinkhole)"
+                );
+            }
+        }
+    }
+
+    if let Some(map) = bpf.map_mut("ALLOWED_IPS") {
+        if let Ok(mut allowed_map) = BpfHashMap::<_, u32, u8>::try_from(map) {
+            for raw_ip in opt.allow_ip.split(',') {
+                let ip_str = raw_ip.trim();
+                if ip_str.is_empty() {
+                    continue;
+                }
+                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                    let ip_u32 = u32::from_ne_bytes(ip.octets());
+                    let _ = allowed_map.insert(ip_u32, 1, 0);
+                    if !is_tui {
+                        println!("[+] Kernel IP whitelist populated: {ip_str}");
+                    }
+                }
+            }
         }
     }
 
@@ -517,13 +770,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("[!] Failed to insert '{name}' into BLOCKED_BINARIES map: {e}");
                 }
             }
-            println!("[+] Populated BLOCKED_BINARIES policy: {}", opt.block);
+            if !is_tui {
+                println!("[+] Populated BLOCKED_BINARIES policy: {}", opt.block);
+            }
         }
+    }
+
+    // Build sensitive blocked files list (combining default + canary + workspace anti-evasion)
+    let mut file_deny_list = opt.block_files.clone();
+    if opt.canary_tokens {
+        file_deny_list.push_str(",.env.canary,credentials.canary");
+    }
+    if opt.workspace.is_some() {
+        file_deny_list.push_str(",.bashrc,.bash_profile,.zshrc,.profile,sudoers,passwd");
     }
 
     if let Some(map) = bpf.map_mut("BLOCKED_FILES") {
         if let Ok(mut blocked_map) = BpfHashMap::<_, [u8; 16], u8>::try_from(map) {
-            for raw_name in opt.block_files.split(',') {
+            for raw_name in file_deny_list.split(',') {
                 let name = raw_name.trim();
                 if name.is_empty() {
                     continue;
@@ -536,16 +800,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("[!] Failed to insert '{name}' into BLOCKED_FILES map: {e}");
                 }
             }
-            println!("[+] Populated BLOCKED_FILES policy: {}", opt.block_files);
+            if !is_tui {
+                println!("[+] Populated BLOCKED_FILES policy: {}", file_deny_list);
+            }
         }
     }
+
+    let _canary_guard = if opt.canary_tokens {
+        Some(CanaryGuard::create(opt.workspace.as_deref()))
+    } else {
+        None
+    };
 
     let mut protected_agent_pids: BpfHashMap<_, u32, u32> = BpfHashMap::try_from(
         bpf.map_mut("PROTECTED_AGENT_PIDS")
             .ok_or("PROTECTED_AGENT_PIDS map not found")?,
     )?;
 
-    // Determine target execution mode: Runner, Attach, or Manual Fence PID
     let runner_command = match &opt.subcmd {
         Some(Commands::Run { command }) => Some(command.clone()),
         _ if !opt.trailing_cmd.is_empty() => Some(opt.trailing_cmd.clone()),
@@ -575,6 +846,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let scrub = opt.scrub_env;
         let allow_env_str = opt.allow_env.clone();
         let cmd_to_exec = cmd_args.clone();
+        let ws_dir = opt.workspace.clone();
+        let proxy_active = opt.proxy_allow_registries;
+        let proxy_port_num = opt.proxy_port;
 
         let pid = unsafe { libc::fork() };
         if pid < 0 {
@@ -595,6 +869,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if scrub {
                 sanitize_environment(&allow_env_str);
+            }
+
+            if let Some(ref dir) = ws_dir {
+                if let Ok(c_dir) = std::ffi::CString::new(dir.as_str()) {
+                    unsafe {
+                        libc::chdir(c_dir.as_ptr());
+                        std::env::set_var("PWD", dir);
+                    }
+                }
+            }
+
+            if proxy_active {
+                let proxy_url = format!("http://127.0.0.1:{proxy_port_num}");
+                unsafe {
+                    std::env::set_var("HTTP_PROXY", &proxy_url);
+                    std::env::set_var("HTTPS_PROXY", &proxy_url);
+                    std::env::set_var("ALL_PROXY", &proxy_url);
+                    std::env::set_var("http_proxy", &proxy_url);
+                    std::env::set_var("https_proxy", &proxy_url);
+                    std::env::set_var("all_proxy", &proxy_url);
+                }
             }
 
             let c_cmd = match std::ffi::CString::new(cmd_to_exec[0].as_str()) {
@@ -624,9 +919,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Immediately fence child_pid in kernel map BEFORE unlocking child!
         protected_agent_pids.insert(child_pid, 1, 0)?;
-        println!(
-            "[+] Zero-race confinement: Fenced target PID {child_pid} inserted into PROTECTED_AGENT_PIDS prior to exec"
-        );
+        if !is_tui {
+            println!(
+                "[+] Zero-race confinement: Fenced target PID {child_pid} inserted into PROTECTED_AGENT_PIDS prior to exec"
+            );
+        }
 
         // Unlock child to execute execvp
         let syn = [1u8; 1];
@@ -662,52 +959,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for &pid in &tree {
             let _ = protected_agent_pids.insert(pid, 1, 0);
         }
-        println!(
-            "[+] Dynamic Attach: Target PID {target_pid} and {count} process tree descendants adopted into kernel fence"
-        );
+        if !is_tui {
+            println!(
+                "[+] Dynamic Attach: Target PID {target_pid} and {count} process tree descendants adopted into kernel fence"
+            );
+        }
     }
 
     for &pid in &opt.fence_pid {
         protected_agent_pids.insert(pid, 1, 0)?;
-        println!("[+] Kernel map populated: PID {pid} fenced.");
+        if !is_tui {
+            println!("[+] Kernel map populated: PID {pid} fenced.");
+        }
     }
 
-    if runner_child_pid.is_none() && attach_pid.is_none() && opt.fence_pid.is_empty() {
+    if runner_child_pid.is_none() && attach_pid.is_none() && opt.fence_pid.is_empty() && !is_tui {
         println!("[i] No target specified. Running telemetry without agent restrictions.");
     }
 
-    let flight_recorder = FlightRecorder::new(opt.audit_log.as_deref())?;
+    let flight_recorder = Arc::new(FlightRecorder::new(opt.audit_log.as_deref())?);
     if let Some(ref path) = opt.audit_log {
-        println!("[+] Flight Recorder active: Streaming audit trail to {path}");
+        if !is_tui {
+            println!("[+] Flight Recorder active: Streaming audit trail to {path}");
+        }
         let init_log = format!(
             "{{\"event\":\"flight_recorder_start\",\"timestamp\":\"{}\",\"block\":\"{}\",\"block_files\":\"{}\"}}",
             format_time(),
             escape_json(&opt.block),
-            escape_json(&opt.block_files)
+            escape_json(&file_deny_list)
         );
         flight_recorder.log(&init_log);
     }
 
-    println!("[+] Streaming process executions (Press Ctrl+C to stop)...");
-
-    let ring_buf = RingBuf::try_from(bpf.take_map("RINGBUF").ok_or("RINGBUF map not found")?)?;
-    let mut async_ring_buf = unsafe { tokio::io::unix::AsyncFd::register(ring_buf) }?;
-
-    let violations_buf = bpf
-        .take_map("VIOLATIONS")
-        .and_then(|m| RingBuf::try_from(m).ok());
-    let mut async_violations = match violations_buf {
-        Some(rb) => unsafe { tokio::io::unix::AsyncFd::register(rb).ok() },
-        None => None,
-    };
-
-    let dropped_events: PerCpuArray<_, u64> = PerCpuArray::try_from(
-        bpf.take_map("DROPPED_EVENTS")
-            .ok_or("DROPPED_EVENTS map not found")?,
-    )?;
-
-    let mut drop_interval = tokio::time::interval(Duration::from_secs(5));
-    drop_interval.tick().await;
+    if opt.proxy_allow_registries {
+        let extra_domains: Vec<String> = opt
+            .allow_domain
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let rec = flight_recorder.clone();
+        let port = opt.proxy_port;
+        tokio::spawn(async move {
+            if let Err(e) = run_registry_proxy(port, extra_domains, rec).await {
+                eprintln!("[!] Registry proxy server error: {e}");
+            }
+        });
+    }
 
     if opt.phantom_sink {
         tokio::spawn(async move {
@@ -754,6 +1052,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    if !is_tui {
+        println!("[+] Streaming process executions (Press Ctrl+C to stop)...");
+    }
+
+    let ring_buf = RingBuf::try_from(bpf.take_map("RINGBUF").ok_or("RINGBUF map not found")?)?;
+    let mut async_ring_buf = unsafe { tokio::io::unix::AsyncFd::register(ring_buf) }?;
+
+    let violations_buf = bpf
+        .take_map("VIOLATIONS")
+        .and_then(|m| RingBuf::try_from(m).ok());
+    let mut async_violations = match violations_buf {
+        Some(rb) => unsafe { tokio::io::unix::AsyncFd::register(rb).ok() },
+        None => None,
+    };
+
+    let dropped_events: PerCpuArray<_, u64> = PerCpuArray::try_from(
+        bpf.take_map("DROPPED_EVENTS")
+            .ok_or("DROPPED_EVENTS map not found")?,
+    )?;
+
+    let mut drop_interval = tokio::time::interval(Duration::from_secs(5));
+    drop_interval.tick().await;
+
+    let mut tui_interval = tokio::time::interval(Duration::from_millis(300));
+    tui_interval.tick().await;
+
     let mut stats = SessionStats {
         start_time: Instant::now(),
         total_execs: 0,
@@ -766,19 +1090,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cryo_triggered: false,
     };
 
-    let blocked_files_set: HashSet<String> = opt
-        .block_files
+    let blocked_files_set: HashSet<String> = file_deny_list
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+
+    let mut recent_procs: VecDeque<(u32, u32, String, String)> = VecDeque::with_capacity(10);
+    let mut recent_alerts: VecDeque<String> = VecDeque::with_capacity(10);
 
     let mut final_exit_code: Option<i32> = None;
 
     loop {
         tokio::select! {
             _ = signal::ctrl_c() => {
-                println!("\n[!] Received SIGINT. Detaching eBPF program and exiting...");
+                if !is_tui {
+                    println!("\n[!] Received SIGINT. Detaching eBPF program and exiting...");
+                }
                 if let Some(cpid) = runner_child_pid {
                     unsafe {
                         libc::kill(cpid as libc::pid_t, libc::SIGTERM);
@@ -790,16 +1118,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(code) = code_res {
                     final_exit_code = Some(code);
                 }
-                // Brief pause to allow kernel ring buffer to drain final events
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 break;
+            }
+            _ = tui_interval.tick(), if is_tui => {
+                // Render ANSI Dashboard
+                let uptime = format_uptime(stats.start_time.elapsed().as_secs());
+                let rate = stats.total_execs as f64 / stats.start_time.elapsed().as_secs_f64().max(0.1);
+                print!("\x1b[2J\x1b[H"); // Clear screen & move to top-left
+                println!("┌──────────────────────────────────────────────────────────────────────────────┐");
+                println!("│  KERNELEYE TOP: In-Kernel eBPF LSM Process Security Monitor                  │");
+                println!("│  Version: 0.2.0 | Mode: ENFORCING | Uptime: {:<8} | Interception: ~3.2 µs   │", uptime);
+                println!("├──────────────────────────────────────────────────────────────────────────────┤");
+                println!("│  Syscalls Intercepted: {:<14} Syscall Rate: {:<7.1} /s        │", stats.total_execs, rate);
+                println!("│  Unique Tracked PIDs : {:<14} Total Violations: {:<17}│", stats.unique_pids.len(), stats.total_violations);
+                println!("│  Blocked Network Drops: {:<13} Blocked Binaries: {:<16}│", stats.network_drops, stats.blocked_binaries.values().sum::<u64>());
+                println!("├──────────────────────────────────────────────────────────────────────────────┤");
+                println!("│ ACTIVE PROCESS TREE TELEMETRY (RECENT EXECUTIONS)                            │");
+                println!("│ PID      PPID     COMM             ARGS                                      │");
+                for (p, pp, c, a) in recent_procs.iter().rev().take(6) {
+                    println!("│ {:<8} {:<8} {:<16} {:<41} │", p, pp, truncate_pad(c, 16), truncate_pad(a, 41));
+                }
+                println!("├──────────────────────────────────────────────────────────────────────────────┤");
+                println!("│ RECENT SECURITY ALERTS (FLIGHT RECORDER)                                     │");
+                if recent_alerts.is_empty() {
+                    println!("│ [OK] No confinement violations trapped. Process tree conforms to policy.     │");
+                } else {
+                    for alert in recent_alerts.iter().rev().take(4) {
+                        println!("│ {:<76} │", truncate_pad(alert, 76));
+                    }
+                }
+                println!("└──────────────────────────────────────────────────────────────────────────────┘");
+                println!("Press Ctrl+C to stop monitoring.");
             }
             _ = drop_interval.tick() => {
                 let total_drops: u64 = match dropped_events.get(&0, 0) {
                     Ok(values) => values.iter().sum(),
                     Err(_) => 0,
                 };
-                if total_drops > 0 {
+                if total_drops > 0 && !is_tui {
                     println!("[WARN] Ring buffer overflow detected: {total_drops} dropped execution events.");
                 }
             }
@@ -821,9 +1178,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .trim_matches(char::from(0));
 
                         stats.total_violations += 1;
-                        if bin_str.starts_with("socket_") {
+                        if bin_str.starts_with("network:") || bin_str.starts_with("socket_") {
                             stats.network_drops += 1;
-                        } else if bin_str.starts_with("inode_") || bin_str == "file_open" || blocked_files_set.contains(bin_str) {
+                        } else if bin_str.starts_with("destruct:") || bin_str.starts_with("evasion:") || bin_str == "file_open" || blocked_files_set.contains(bin_str) {
                             *stats.blocked_files.entry(bin_str.to_string()).or_insert(0) += 1;
                         } else {
                             *stats.blocked_binaries.entry(bin_str.to_string()).or_insert(0) += 1;
@@ -841,10 +1198,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "blocked"
                         };
 
-                        eprintln!(
-                            "{{\"event\":\"confinement_violation\",\"timestamp_ns\":{},\"agent_pid\":{},\"child_pid\":{},\"comm\":\"{}\",\"binary\":\"{}\",\"action\":\"{}\"}}",
-                            event.timestamp_ns, event.agent_pid, event.child_pid, comm_str, bin_str, action_str
+                        let alert_msg = format!(
+                            "[{}] PID {} ({}) -> {} [{}]",
+                            format_time(), event.child_pid, comm_str, bin_str, action_str
                         );
+                        if recent_alerts.len() >= 10 {
+                            recent_alerts.pop_front();
+                        }
+                        recent_alerts.push_back(alert_msg);
+
+                        if !is_tui {
+                            eprintln!(
+                                "{{\"event\":\"confinement_violation\",\"timestamp_ns\":{},\"agent_pid\":{},\"child_pid\":{},\"comm\":\"{}\",\"binary\":\"{}\",\"action\":\"{}\"}}",
+                                event.timestamp_ns, event.agent_pid, event.child_pid, comm_str, bin_str, action_str
+                            );
+                        }
 
                         let violation_log = format!(
                             "{{\"ts_ns\":{},\"event\":\"violation\",\"agent_pid\":{},\"child_pid\":{},\"comm\":\"{}\",\"binary\":\"{}\",\"action\":\"{}\"}}",
@@ -853,23 +1221,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         flight_recorder.log(&violation_log);
 
                         if opt.cryo_freeze && event.agent_pid > 0 {
-                            eprintln!(
-                                "[CRYO-FREEZE] Confinement violation trapped: {} ({})",
-                                bin_str, comm_str
-                            );
-                            eprintln!(
-                                "[CRYO-FREEZE] Process tree suspended in RAM (SIGSTOP): Root PID {} | Worker PID {}",
-                                event.agent_pid, event.child_pid
-                            );
+                            if !is_tui {
+                                eprintln!(
+                                    "[CRYO-FREEZE] Confinement violation trapped: {} ({})",
+                                    bin_str, comm_str
+                                );
+                                eprintln!(
+                                    "[CRYO-FREEZE] Process tree suspended in RAM (SIGSTOP): Root PID {} | Worker PID {}",
+                                    event.agent_pid, event.child_pid
+                                );
+                            }
                             unsafe {
                                 libc::kill(event.child_pid as libc::pid_t, libc::SIGSTOP);
                                 libc::kill(event.agent_pid as libc::pid_t, libc::SIGSTOP);
                             }
                         } else if opt.kill_on_violation && event.agent_pid > 0 {
-                            eprintln!(
-                                "[KILL-SWITCH] Terminating fenced root agent session PID {} with SIGKILL...",
-                                event.agent_pid
-                            );
+                            if !is_tui {
+                                eprintln!(
+                                    "[KILL-SWITCH] Terminating fenced root agent session PID {} with SIGKILL...",
+                                    event.agent_pid
+                                );
+                            }
                             unsafe {
                                 libc::kill(event.agent_pid as libc::pid_t, libc::SIGKILL);
                             }
@@ -908,13 +1280,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stats.total_execs += 1;
                     stats.unique_pids.insert(event.pid);
 
+                    if recent_procs.len() >= 10 {
+                        recent_procs.pop_front();
+                    }
+                    recent_procs.push_back((event.pid, event.ppid, comm_str.to_string(), args_display.to_string()));
+
                     let exec_log = format!(
                         "{{\"ts\":\"{}\",\"event\":\"exec\",\"pid\":{},\"ppid\":{},\"comm\":\"{}\",\"args\":\"{}\"}}",
                         time_str, event.pid, event.ppid, escape_json(comm_str), escape_json(args_display)
                     );
                     flight_recorder.log(&exec_log);
 
-                    if !opt.quiet {
+                    if !opt.quiet && !is_tui {
                         println!(
                             "[{time_str}] PID: {} | PPID: {} | COMM: {} | ARGS: {}",
                             event.pid, event.ppid, comm_str, args_display
@@ -924,6 +1301,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 guard.clear_ready();
             }
         }
+    }
+
+    if is_tui {
+        print!("\x1b[2J\x1b[H"); // Clear screen upon exit
     }
 
     print_scorecard(&stats, final_exit_code);

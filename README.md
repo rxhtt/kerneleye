@@ -304,34 +304,49 @@ Usage: kerneleye [OPTIONS] [COMMAND]
 Commands:
   run     Execute a command directly inside zero-race kernel confinement: kerneleye run -- <CMD> [ARGS...]
   attach  Attach live to an existing running process tree and dynamically adopt it into the kernel fence
+  top     Launch real-time interactive terminal monitoring dashboard: kerneleye top
   help    Print this message or the help of the given subcommand(s)
 
 Options:
-      --fence-pid <PID>            Target PID(s) to fence. Any child spawned by these PIDs will be restricted
-      --kill-on-violation          Terminate the fenced root agent session immediately upon confinement violation
-      --block <BLOCK>              Comma-separated list of unauthorized binary basenames [default: curl,wget,nc,ncat,socat]
-      --block-files <BLOCK_FILES>  Comma-separated list of sensitive file basenames to block [default: id_rsa,id_ed25519,credentials,.env,shadow,authorized_keys]
-      --audit-only                 Run in audit mode: log violations to telemetry without blocking operations
-      --cryo-freeze                Freeze offending process tree in RAM (SIGSTOP) instead of terminating it
-      --phantom-sink               Launch active counter-deception Phantom Sinkhole on 127.0.0.1:65530
-      --audit-log <PATH>           Path to flight recorder immutable JSONL audit log
-      --scrub-env                  Sanitize high-risk credentials (AWS_*, OPENAI_*, GITHUB_*) from child environment
-      --allow-env <ALLOW_ENV>      Comma-separated list of environment variables to preserve [default: PATH,HOME,USER,SHELL,TERM,LANG]
-  -q, --quiet                      Suppress verbose process execution trace in runner mode
-  -h, --help                       Print help
-  -V, --version                    Print version
+      --fence-pid <PID>              Target PID(s) to fence. Any child spawned by these PIDs will be restricted
+      --kill-on-violation            Terminate the fenced root agent session immediately upon confinement violation
+      --block <BLOCK>                Comma-separated list of unauthorized binary basenames [default: curl,wget,nc,ncat,socat]
+      --block-files <BLOCK_FILES>    Comma-separated list of sensitive file basenames to block [default: id_rsa,id_ed25519,credentials,.env,shadow,authorized_keys]
+      --audit-only                   Run in audit mode: log violations to telemetry without blocking operations
+      --cryo-freeze                  Freeze offending process tree in RAM (SIGSTOP) instead of terminating it
+      --phantom-sink                 Launch active counter-deception Phantom Sinkhole on 127.0.0.1:65530
+      --proxy-allow-registries       Transparent local audit proxy on 127.0.0.1:18080: permits package registries (npm, cargo, pypi, git) & blocks exfiltration
+      --proxy-port <PORT>            Port for the transparent registry proxy [default: 18080]
+      --allow-domain <DOMAINS>       Comma-separated list of extra trusted domains to permit through the registry proxy
+      --allow-ip <ALLOW_IP>          Comma-separated list of IPv4 addresses to whitelist for in-kernel network egress
+      --allow-loopback               In-kernel allow loopback network traffic (127.0.0.0/8 and ::1)
+      --workspace <DIR>              Strict workspace boundary directory sandboxing. Restricts execution and file modifications to DIR
+      --canary-tokens                Deploy honeypot canary credential tokens (.env.canary, credentials.canary) with automated tripwires
+      --tui                          Launch real-time interactive terminal monitoring dashboard
+      --audit-log <PATH>             Path to flight recorder immutable JSONL audit log
+      --scrub-env                    Sanitize high-risk credentials (AWS_*, OPENAI_*, GITHUB_*) from child environment
+      --allow-env <ALLOW_ENV>        Comma-separated list of environment variables to preserve [default: PATH,HOME,USER,SHELL,TERM,LANG]
+  -q, --quiet                        Suppress verbose process execution trace in runner mode
+  -h, --help                         Print help
+  -V, --version                      Print version
 ```
 
 ### Examples
 
 ```bash
-# 1. Direct Runner with secret scrubbing and flight recorder
-sudo kerneleye --scrub-env --audit-log audit.jsonl run -- python3 agent.py
+# 1. Zero-Race Confinement with Package Registry Whitelist (Solves "Don't Break npm install")
+sudo kerneleye --proxy-allow-registries --scrub-env run -- npm install
 
-# 2. Dynamic Attach to an existing background daemon or agent
+# 2. Strict Workspace Boundary with Honeypot Canaries
+sudo kerneleye --workspace /home/user/project --canary-tokens run -- python3 agent.py
+
+# 3. Interactive Real-Time Terminal Monitor
+sudo kerneleye top
+
+# 4. Dynamic Attach to an existing background daemon or agent
 sudo kerneleye attach 48102
 
-# 3. Complete Defense-in-Depth with Cryo-Freeze and Phantom Sinkhole
+# 5. Complete Defense-in-Depth with Cryo-Freeze and Phantom Sinkhole
 sudo kerneleye \
   --block "curl,wget,nc,ncat,socat,ssh" \
   --block-files ".env,id_rsa,credentials" \
