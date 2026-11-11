@@ -51,5 +51,6 @@ jobs:
       - name: Install SDK & Run Tests
         run: |
           cd bindings/python
+          pip install pytest
           pip install -e .
-          python tests/test_sdk.py
+          pytest tests/test_sdk.py
